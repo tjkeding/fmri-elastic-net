@@ -1,0 +1,174 @@
+# CONFIGURATION for PREDICTIVE MODELING with an ELASTIC NET
+
+# Analysis Type
+# "regression" (continuous outcome) or "classification" (binary outcome only, multi-class to come)
+analysis_type: "classification"
+
+# Analysis Mode:
+# "predict" or "correlate"
+# "predict" determines model and feature significance via external validity/generalization (powerful, high 'significance' threshold, requires large samples N~1000s)
+# "correlate" determines model and feature significance via internal validity (less powerful, lower 'significance' threshold, more appropriate for small samples N~100s)
+analysis_mode: "correlate"
+
+# Covariate Method:
+# "none", "incorporate", or "pre_regress"
+# "none" indicates no covariates are included and data_cols.covariate_cols is ignored
+# "incorporate" indicates model will predict outcome including each covariate as a feature 
+# "pre_regress" indicates model will predict residualized outcome controlling for covariates
+covariate_method: "none"
+
+# Feature Reduction Method:
+# "none"        - uses raw columns as features (small/medium feature sets)
+# "cluster_pca" - HDBSCAN clustering + PCA per cluster (assumes features form discrete non-overlapping groups;
+#                 appropriate for questionnaire/genomic data; typically inappropriate for brain activation data)
+# "apriori"     - external CSV mapping features to pre-defined clusters + PCA per cluster
+# "ica"         - Independent Component Analysis (assumes features participate in multiple overlapping components;
+#                 appropriate for brain data where regions participate in multiple networks)
+feature_reduction_method: "cluster_pca"
+
+# File Paths
+paths:
+  # Raw data - includes outcome, covariates, and brain features (assumes preprocessed, including QC/outlier removal)
+  # Incomplete rows with missing data will be listwise deleted
+  data_file: "/absolute/data/file/path/here"
+
+  # Output run directory
+  output_dir: "/absolute/output/run/path/here"
+  
+  # Required if feature_reduction_method is "apriori"
+  # Path to a 2-column CSV containing feature names (MUST correspond to features in data_file) and cluster labels. Header is ignored.
+  apriori_clustering_file: null
+
+# CPU Parallelization
+n_cores: 30
+
+# Data Columns
+data_cols:
+  subject_id_col: "SUBJ_ID" # ID column to be removed from features (used for output)
+  post_score_col: "TX_RESPONSE" # Outcome column to be predicted
+  
+  # A list of all covariates to include (column names in data_file)
+  # If covariate_method == "none", this will be ignored
+  covariate_cols:
+  # - "COV_COL_1"
+    
+  # Neural features to include in feature clustering (column label contains substring)
+  # Ideally, ensure all features you want involved in clustering have been named "brain_{FEATURE_LABEL}"
+  brain_feature_substr: "brain" 
+
+# Clustering Parameters (Hierarchical, Density-Based Spatial Clustering of Applications with Noise [HDBSCAN])
+clustering_params:
+  # The minimum number of features required to form a cluster.
+  # "auto" computes: max(3, ceil(log2(P) * (100/N)^0.25)) where P=features, N=samples
+  # Or set an integer value directly (e.g. 2, 5, 10)
+  # Singleton ("noise") features will be treated as their own cluster and passed to the model as raw feature.
+  # If a feature is its own cluster, its importance will be placed in report_cluster_importance.csv
+  # If a feature belongs to a cluster, its importance will be placed in report_individiual_importance.csv
+  min_cluster_size: "auto"
+
+  # Distance metric for computing feature similarity before clustering
+  # "pearson"  - Pearson correlation (linear relationships)
+  # "spearman" - Spearman rank correlation (monotonic relationships, robust to outliers)
+  # (dcor: planned for future release)
+  distance_metric: "spearman"
+
+  # How to convert similarity to distance
+  # "unsigned" - 1 - |sim| (treats positive and negative correlations equivalently)
+  # "signed"   - (1 - sim) / 2 (preserves sign: positively correlated features cluster together)
+  # Note: "signed" has no effect when distance_metric is "dcor" (dcor is always non-negative)
+  sign_handling: "unsigned"
+
+# ICA Parameters (only used when feature_reduction_method is "ica")
+ica_params:
+  # Number of independent components to extract
+  # "auto" - uses Parallel Analysis to determine K (recommended)
+  #          Threshold controlled by stats_params.ci_level (e.g., 0.95 = 95th percentile)
+  # Or set an integer value directly (e.g., 10, 20, 50)
+  n_components: "auto"
+
+  # Maximum iterations for FastICA convergence
+  max_iter: 1000
+
+  # Random state for reproducibility
+  random_state: 42
+
+# Model & Tuning Parameters
+# Typically DON'T CHANGE anything here - included in case models have unexpected, exceptionally-poor performance
+model_params:
+  # L1 ratio bounds for the uniform search distribution (predict mode: LASSO-dominant)
+  l1_min_predict: 0.5      # Minimum L1 ratio for predict mode (guarantees sparsity)
+  l1_max_predict: 0.99     # Maximum L1 ratio for predict mode (avoids pure LASSO instability)
+
+  # L1 ratio bounds for the uniform search distribution (correlate mode: Ridge-dominant)
+  l1_min_correlate: 0.001  # Minimum L1 ratio for correlate mode (allows near-pure Ridge)
+  l1_max_correlate: 0.2    # Maximum L1 ratio for correlate mode (guarantees Ridge-dominance)
+
+  # 'alpha' (regularization strength) bounds for the log-uniform search distribution
+  alpha_min_predict: 0.001
+  alpha_max_predict: 100.0
+  alpha_min_correlate: 0.001
+  alpha_max_correlate: 100.0
+
+  # Penalty weights to "protect" covariates (1.0 = covariates and brain features equally considered; 0.001 = extremely covariate-privileged)
+  # If covariate_method is "none", this is will be ignored.
+  covariate_penalty_weights: [1.0, 0.1, 0.01, 0.001]
+
+  # RESERVED (not currently active — placeholder for future metric extension)
+  regression_metric: "neg_root_mean_squared_error"
+  classification_metric: "neg_log_loss"
+
+# Cross-Validation Parameters
+# CHANGE n_outer_folds and n_inner_folds to fit the sample size
+# E.g. with N=100, n_outer_folds==10 and n_inner_folds==5, 10 subjects/fold for evaluation, 18 subjects/fold for tuning
+cv_params:
+  # Folds for the outer cv loop (performance estimation)
+  # Set to an integer for K-Fold, or "loo" for Leave-One-Out cross-validation
+  n_outer_folds: 10
+  # Folds for the inner cv loop (hyperparameter tuning)
+  # Set to an integer for K-Fold, or "loo" for Leave-One-Out cross-validation
+  n_inner_folds: 3
+  # INTENDED FOR SMALLER SAMPLE SIZES
+  # If N~100s or less, repeat tuning with random initialization (prevents overfitting of hyperparameters)
+  # In all other cases, set this to 1
+  # Note: n_inner_repeats is ignored when n_inner_folds is "loo"
+  n_inner_repeats: 5
+  # Number of hyperparameter combinations sampled per RandomizedSearchCV call.
+  # Applied uniformly to ALL tuning stages (nested CV, permutation null, selection
+  # frequency, bootstrap, block permutation). Larger values improve tuning quality
+  # at the cost of runtime. Recommended range: 10-100. For a 2-parameter space
+  # (alpha, l1_ratio), 20-50 is typically sufficient.
+  # NOTE: This parameter has no default — the pipeline will exit with an error if absent.
+  n_random_search_iter: 20
+  # A global random seed for reproducibility
+  random_state: 42
+
+# Statistical Parameters
+stats_params:
+  # Number of permutations for model performance estimation
+  n_permutations: 10000
+  
+  # Number of bootstrap samples for feature/cluster importance
+  n_bootstraps: 10000
+  
+  # Number of permutations for block permutation tests (independent from n_permutations).
+  # Block permutation is expensive (full nested CV per iteration); typical values: 100-1000.
+  n_block_permutations: 500
+  # The confidence level for all CI calculations.
+  # This is the PRIMARY threshold for determining feature significance in all modes
+  ci_level: 0.95
+
+  # Save raw null and bootstrap distributions for post-hoc analysis and visualization.
+  # Bootstrap coefficients saved as bootstrap_coef_distribution.npz (compressed NumPy archive).
+  # Block permutation null scores saved as block_perm_null_{label}.csv per block.
+  # Set to false if storage is constrained (e.g., high-dimensional data with many bootstraps).
+  save_distributions: true
+
+# Block Permutation Tests
+# Define one or more "blocks" of features to test for unique contributions (R2-change or AUC-change).
+block_permutation_tests:
+  # The 'label' for this test, followed by a substring identifier for included features
+  brain_block: "brain"
+
+  # add other explicit blocks with lists is option
+  # pre_score_only:
+  #   - "ViewNeg"

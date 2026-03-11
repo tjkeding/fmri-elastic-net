@@ -1,0 +1,12 @@
+# Whitelist approach: ignore everything, then selectively allow
+*
+
+# Allowed files
+!.gitignore
+!config_template.yaml
+!environment.yaml
+!fmri-elastic-net.py
+!INPUT_SPECIFICATION.md
+!README.md
+!run_fmri-elastic-net.sh
+!run_template.sh
