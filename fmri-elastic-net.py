@@ -9,7 +9,7 @@ FEATURES:
   fits the model in reduced space with fixed hyperparameters, and back-projects coefficients
   to the invariant original feature space for meaningful aggregation across iterations.
 - Covariate Handling: Incorporate, Pre-Regress (Cross-Val), or None.
-- Two modes for Analysis: Predict (Lasso) vs. Correlate (Ridge/Mapping).
+- Two modes for Analysis: Predict (full elastic net spectrum, L1 0.01–0.99, data-driven) vs. Correlate (Ridge-dominant, L1 0.001–0.2).
 - Validation: Supports Repeated K-Fold and LOO for small datasets.
 - Statistical Inference: Bootstrap CIs + Probability of Direction (pd) + BH-FDR correction.
 - Comprehensive Evaluation Metrics: RMSE/MAE/R²/Pearson r (regression); AUC-ROC/Log-Loss/
@@ -473,7 +473,6 @@ def load_and_prep_data(config, output_dir):
         logging.info("Covariate Method: 'none' (Bypass)")
         X_cov = pd.DataFrame(index=Y.index)
         active_covs = []
-        config['model_params']['covariate_penalty_weights'] = [1.0]
     else:
         missing = [c for c in covariate_cols if c not in df.columns]
         if missing:
@@ -768,10 +767,11 @@ def create_model_and_param_dist(config, all_feature_names, active_covariate_name
         alpha_param: alpha_search,
     }
 
-    # Wire covariate_penalty_weights from config: only when covariates are active
+    # Wire covariate penalty_weight loguniform distribution: only when covariates are active
     if config['covariate_method'] != 'none' and cov_indices:
-        cov_pw_cfg = model_cfg.get('covariate_penalty_weights', [1.0, 0.1, 0.01, 0.001])
-        param_dist['cov_scaler__penalty_weight'] = cov_pw_cfg
+        pw_min = model_cfg.get('covariate_penalty_weight_min', 0.001)
+        pw_max = model_cfg.get('covariate_penalty_weight_max', 1.0)
+        param_dist['cov_scaler__penalty_weight'] = loguniform(pw_min, pw_max)
 
     pipeline = Pipeline([
         ('scaler', StandardScaler()),
@@ -1770,9 +1770,13 @@ def _compute_importance_report(df_coef, all_feats, feat_std_map, config, active_
 
 
 def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, apriori_map=None):
-    """
-    Bootstrap feature importance. Reducer fit once on full data (descriptive).
-    Individual bootstrap iterations correctly clone and refit on resampled data.
+    """Run Approach Y bootstrap importance estimation.
+
+    Setup: fits reducer and tunes hyperparameters once on the full dataset
+    (descriptive pathway) to establish best_params and feat_std_map.
+    Per iteration: clones and refits reducer on resampled brain features, fits model
+    with fixed best_params, back-projects coefficients to original feature space
+    via _backproject_coef_original_space. See _boot_task for iteration-level details.
     """
     logging.info("--- Bootstrap Importance ---")
     n_boot = config['stats_params']['n_bootstraps']

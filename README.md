@@ -89,6 +89,31 @@ Rows with any missing values are removed by listwise deletion before analysis.
 
 ---
 
+## Outcome Types
+
+The pipeline supports four distinct outcome types, determined by `analysis_type` and the
+shape of the outcome column(s):
+
+| Outcome type | `analysis_type` | Outcome format | sklearn estimator |
+|---|---|---|---|
+| Single-task regression | `"regression"` | One continuous numeric column | `ElasticNet` |
+| Multi-task regression | `"regression"` | Multiple continuous numeric columns | `MultiTaskElasticNet` |
+| Binary classification | `"classification"` | One integer column, 2 unique labels | `LogisticRegression(penalty='elasticnet', solver='saga')` |
+| Multi-class classification | `"classification"` | One integer column, 3+ unique labels | `LogisticRegression(penalty='elasticnet', solver='saga')` with OVR decomposition |
+
+Multi-task regression (`MultiTaskElasticNet`) carries two important constraints:
+- **Shared sparsity**: all tasks share the same feature support — the L1/L2 mixed norm
+  enforces a joint sparsity pattern across tasks. Features are jointly selected (non-zero)
+  or jointly excluded (zero) for all tasks simultaneously. If different tasks are driven by
+  different feature subsets, consider running separate single-task analyses instead.
+- **No sample weights**: `sample_weight_col` is silently ignored for `MultiTaskElasticNet`
+  (the estimator does not support per-sample weights).
+
+Multi-task regression is triggered automatically when `data_cols.post_score_col` refers
+to multiple columns in the data file.
+
+---
+
 ## Analysis Modes
 
 Choosing the right analysis mode is the most consequential configuration decision.
@@ -124,8 +149,11 @@ It controls both the L1 ratio search space and the implicit regularization philo
 | `pre_regress` | Outcome residualized on covariates fold-locally before prediction | Covariates are pure nuisance variables; their unique contribution should be removed |
 
 When `incorporate` is used, a `covariate_penalty_weight` hyperparameter is searched
-over the `model_params.covariate_penalty_weights` list to modulate regularization
-applied to covariate columns relative to brain features.
+via a loguniform distribution over `[model_params.covariate_penalty_weight_min,
+model_params.covariate_penalty_weight_max]` to modulate regularization applied to
+covariate columns relative to brain features. Because this adds a third continuous
+hyperparameter to the search space, `cv_params.n_random_search_iter` should be
+increased to 50–100 (vs. 20–50 for the default 2-parameter space).
 
 ---
 

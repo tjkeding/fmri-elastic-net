@@ -59,6 +59,23 @@ decomposition internally for per-class AUC, sensitivity, and specificity.
 **Regression outcome**: Any continuous numeric column. Multi-column outcomes trigger
 `MultiTaskElasticNet` automatically.
 
+**Outcome type summary:**
+
+| Outcome type | `analysis_type` | Outcome format | sklearn estimator |
+|---|---|---|---|
+| Single-task regression | `"regression"` | One continuous numeric column | `ElasticNet(max_iter=10000, selection='random')` |
+| Multi-task regression | `"regression"` | Multiple continuous numeric columns (DataFrame Y, shape N × K) | `MultiTaskElasticNet(max_iter=10000, selection='random')` |
+| Binary classification | `"classification"` | One integer column, exactly 2 unique labels | `LogisticRegression(penalty='elasticnet', solver='saga', max_iter=5000)` |
+| Multi-class classification | `"classification"` | One integer column, 3+ unique labels | `LogisticRegression(penalty='elasticnet', solver='saga', max_iter=5000)` with OVR decomposition |
+
+**Multi-task regression constraints:**
+- **Shared sparsity pattern**: `MultiTaskElasticNet` uses a mixed L1/L2 norm that enforces
+  identical feature support across all K tasks. Features are jointly selected (non-zero) or
+  jointly excluded (zero) for all tasks simultaneously. If tasks have heterogeneous sparsity
+  structures, consider running separate single-task `ElasticNet` models.
+- **Sample weights not supported**: `sample_weight_col` is silently ignored when
+  `MultiTaskElasticNet` is the active estimator.
+
 **Optional column** (advanced):
 - `data_cols.sample_weight_col`: Column of non-negative sample weights. If present,
   weights are passed to the model's `fit` call where supported. `MultiTaskElasticNet`
@@ -161,7 +178,8 @@ Both formulas are proper metric space mappings into [0, 2]. NaN similarity value
 | `model_params.alpha_max_predict` | float | `100.0` | Maximum alpha for `predict` mode |
 | `model_params.alpha_min_correlate` | float | `0.001` | Minimum alpha for `correlate` mode |
 | `model_params.alpha_max_correlate` | float | `100.0` | Maximum alpha for `correlate` mode |
-| `model_params.covariate_penalty_weights` | list of float | `[1.0, 0.1, 0.01, 0.001]` | Covariate feature scaling factors searched in `RandomizedSearchCV`. A value of 1.0 = no adjustment; 0.001 = extreme covariate privilege (covariate columns scaled ×1000 relative to brain features before standardization). Ignored when `covariate_method: "none"` |
+| `model_params.covariate_penalty_weight_min` | float | `0.001` | Lower bound of the loguniform search distribution for covariate penalty weight. A value of 0.001 = extreme covariate privilege (covariate columns scaled ×1000 relative to brain features before standardization). Only active when `covariate_method: "incorporate"` |
+| `model_params.covariate_penalty_weight_max` | float | `1.0` | Upper bound of the loguniform search distribution for covariate penalty weight. A value of 1.0 = no adjustment (covariate columns treated identically to brain features). Only active when `covariate_method: "incorporate"` |
 | `model_params.regression_metric` | str | `"neg_root_mean_squared_error"` | RESERVED — not currently active. Inner CV scoring is hardcoded to `neg_root_mean_squared_error` |
 | `model_params.classification_metric` | str | `"neg_log_loss"` | RESERVED — not currently active. Inner CV scoring is hardcoded to `neg_log_loss` |
 
@@ -183,7 +201,7 @@ Because `LogisticRegression` uses `C = 1/alpha`, the alpha search range is inver
 | `cv_params.n_outer_folds` | int or `"loo"` | — | Integer ≥ 2, or `"loo"` | Outer CV folds for performance estimation |
 | `cv_params.n_inner_folds` | int or `"loo"` | — | Integer ≥ 2, or `"loo"` | Inner CV folds for hyperparameter tuning |
 | `cv_params.n_inner_repeats` | int | `1` | Integer ≥ 1 | Number of repeated inner CV rounds. Ignored when `n_inner_folds: "loo"` |
-| `cv_params.n_random_search_iter` | int | **NO DEFAULT — required** | Integer ≥ 1 | Number of hyperparameter combinations sampled per `RandomizedSearchCV` call. Applied uniformly to all stages (nested CV, permutation null, selection frequency, bootstrap, block permutation). Recommended: 20–50 for the default 2-parameter space |
+| `cv_params.n_random_search_iter` | int | **NO DEFAULT — required** | Integer ≥ 1 | Number of hyperparameter combinations sampled per `RandomizedSearchCV` call. Applied uniformly to all stages (nested CV, permutation null, selection frequency, bootstrap, block permutation). Recommended: 20–50 for the default 2-parameter space (alpha, l1_ratio); 50–100 when `covariate_method: "incorporate"` (3-parameter space: alpha, l1_ratio, penalty_weight) |
 | `cv_params.random_state` | int | — | Any integer | Global random seed for CV splitters and `RandomizedSearchCV` |
 
 **LOO behavior:**
@@ -292,7 +310,7 @@ Constructs an sklearn `Pipeline` with three steps:
 Hyperparameter distribution for `RandomizedSearchCV`:
 - `model__l1_ratio`: `uniform(l1_min, l1_max - l1_min)` — mode-specific bounds
 - `model__alpha` or `model__C`: `loguniform(a_min, a_max)` (regression) or `loguniform(1/a_max, 1/a_min)` (classification)
-- `cov_scaler__penalty_weight`: discrete list from `covariate_penalty_weights` (only when `covariate_method != "none"`)
+- `cov_scaler__penalty_weight`: `loguniform(covariate_penalty_weight_min, covariate_penalty_weight_max)` (only when `covariate_method == "incorporate"`)
 
 Primary performance metric:
 - Regression: `neg_root_mean_squared_error` (inner CV hyperparameter selection); R² (outer CV performance)
@@ -560,7 +578,7 @@ sh run_fmri-elastic-net.sh <CONFIG_PATH> <LOG_DIR> <MEM_GB> <CPUS_PER_TASK> <N_J
 | Condition | Behavior |
 |-----------|----------|
 | All rows missing | `ValueError` raised; pipeline exits |
-| `covariate_method: "none"` | `covariate_cols` ignored; `covariate_penalty_weights` forced to `[1.0]` |
+| `covariate_method: "none"` | `covariate_cols` ignored; `cov_scaler__penalty_weight` excluded from hyperparameter search (covariate indices empty) |
 | `n_inner_repeats` with LOO inner CV | `n_inner_repeats` silently ignored; `LeaveOneOut` used |
 | P = 1 feature (after reduction) | `_parallel_analysis` returns 1 component; `_compute_distance_matrix` returns zero matrix |
 | `min_cluster_size` larger than P | HDBSCAN assigns all features to noise (label −1); each treated as singleton |

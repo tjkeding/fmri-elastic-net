@@ -111,9 +111,12 @@ model_params:
   alpha_min_correlate: 0.001
   alpha_max_correlate: 100.0
 
-  # Penalty weights to "protect" covariates (1.0 = covariates and brain features equally considered; 0.001 = extremely covariate-privileged)
-  # If covariate_method is "none", this is will be ignored.
-  covariate_penalty_weights: [1.0, 0.1, 0.01, 0.001]
+  # Penalty weight bounds for covariate protection (loguniform search distribution)
+  # 1.0 = covariates and brain features equally regularized; 0.001 = extreme covariate privilege
+  # Searched via loguniform(min, max) — equal sampling probability per order of magnitude
+  # Only active when covariate_method is "incorporate"; ignored for "none" or "pre_regress"
+  covariate_penalty_weight_min: 0.001  # Lower bound (most covariate-privileged)
+  covariate_penalty_weight_max: 1.0    # Upper bound (no covariate privilege)
 
   # RESERVED (not currently active — placeholder for future metric extension)
   regression_metric: "neg_root_mean_squared_error"
@@ -137,8 +140,10 @@ cv_params:
   # Number of hyperparameter combinations sampled per RandomizedSearchCV call.
   # Applied uniformly to ALL tuning stages (nested CV, permutation null, selection
   # frequency, bootstrap, block permutation). Larger values improve tuning quality
-  # at the cost of runtime. Recommended range: 10-100. For a 2-parameter space
-  # (alpha, l1_ratio), 20-50 is typically sufficient.
+  # at the cost of runtime. Recommended range: 20-100.
+  # - Default 2-parameter space (alpha, l1_ratio): 20-50 is typically sufficient.
+  # - 3-parameter space when covariate_method is "incorporate" (alpha, l1_ratio,
+  #   penalty_weight): recommend 50-100 to adequately cover the expanded search space.
   # NOTE: This parameter has no default — the pipeline will exit with an error if absent.
   n_random_search_iter: 20
   # A global random seed for reproducibility
