@@ -94,14 +94,15 @@ Rows with any missing values are removed by listwise deletion before analysis.
 Choosing the right analysis mode is the most consequential configuration decision.
 It controls both the L1 ratio search space and the implicit regularization philosophy.
 
-### `predict` — LASSO-dominant elastic net
+### `predict` — Full-spectrum elastic net
 
-- L1 ratio search space: 0.5–0.99 (sparse, feature-selecting solutions)
+- L1 ratio search space: 0.01–0.99 (full elastic net spectrum; data-driven regularization balance)
 - Model performance evaluated via external validity (nested CV R² or AUC)
-- Emphasis on generalization and sparsity
+- Emphasis on generalization; regularization balance selected data-driven by nested CV
 - **Best use case:** large samples (N ~ 1,000s) where generalization to unseen data
-  is the primary scientific question; high-dimensional feature sets where true sparsity
-  is expected; feature selection as an objective in itself
+  is the primary scientific question; nested CV selects the optimal L1/L2 balance
+  for the data, including Ridge-dominant solutions when features are multicollinear
+  or signal is diffuse
 
 ### `correlate` — Ridge-dominant elastic net
 

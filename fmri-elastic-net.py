@@ -733,7 +733,7 @@ def create_model_and_param_dist(config, all_feature_names, active_covariate_name
     cov_indices = list(range(n_covs)) if n_covs > 0 else []
 
     if mode == 'predict':
-        l1_min = model_cfg.get('l1_min_predict', 0.5)
+        l1_min = model_cfg.get('l1_min_predict', 0.01)
         l1_max = model_cfg.get('l1_max_predict', 0.99)
     else:
         l1_min = model_cfg.get('l1_min_correlate', 0.001)

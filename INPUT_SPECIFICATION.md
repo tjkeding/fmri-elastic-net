@@ -153,7 +153,7 @@ Both formulas are proper metric space mappings into [0, 2]. NaN similarity value
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `model_params.l1_min_predict` | float | `0.5` | Lower bound of uniform L1 ratio search for `predict` mode |
+| `model_params.l1_min_predict` | float | `0.01` | Lower bound of uniform L1 ratio search for `predict` mode (full elastic net spectrum [0.01, 0.99]) |
 | `model_params.l1_max_predict` | float | `0.99` | Upper bound of uniform L1 ratio search for `predict` mode |
 | `model_params.l1_min_correlate` | float | `0.001` | Lower bound of uniform L1 ratio search for `correlate` mode |
 | `model_params.l1_max_correlate` | float | `0.2` | Upper bound of uniform L1 ratio search for `correlate` mode |

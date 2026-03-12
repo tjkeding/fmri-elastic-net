@@ -56,7 +56,7 @@ data_cols:
   # Ideally, ensure all features you want involved in clustering have been named "brain_{FEATURE_LABEL}"
   brain_feature_substr: "brain"
 
-  # sample_weight_col: null  # Optional: column of non-negative sample weights (ignored by MultiTaskElasticNet)
+  sample_weight_col: null  # Optional: column of non-negative sample weights; ignored by MultiTaskElasticNet
 
 # Clustering Parameters (Hierarchical, Density-Based Spatial Clustering of Applications with Noise [HDBSCAN])
 clustering_params:
@@ -97,8 +97,8 @@ ica_params:
 # Model & Tuning Parameters
 # Typically DON'T CHANGE anything here - included in case models have unexpected, exceptionally-poor performance
 model_params:
-  # L1 ratio bounds for the uniform search distribution (predict mode: LASSO-dominant)
-  l1_min_predict: 0.5      # Minimum L1 ratio for predict mode (guarantees sparsity)
+  # L1 ratio bounds for the uniform search distribution (predict mode: full elastic net spectrum)
+  l1_min_predict: 0.01     # Minimum L1 ratio for predict mode (allows full elastic net spectrum; data-driven selection)
   l1_max_predict: 0.99     # Maximum L1 ratio for predict mode (avoids pure LASSO instability)
 
   # L1 ratio bounds for the uniform search distribution (correlate mode: Ridge-dominant)
