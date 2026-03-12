@@ -359,7 +359,7 @@ class ICATransformer(BaseEstimator, TransformerMixin):
             whiten='unit-variance'
         )
         self.ica_.fit(X_std)
-        # mixing_unnorm_: P x K, no column-wise normalization (F5 fix retained)
+        # mixing_unnorm_: P x K, no column-wise normalization
         self.mixing_unnorm_ = self.ica_.mixing_
         self.ic_names_ = [f"IC_{i + 1}" for i in range(K)]
         return self
@@ -448,7 +448,7 @@ def load_and_prep_data(config, output_dir):
     except FileNotFoundError as err:
         raise FileNotFoundError(f"Data file not found: {config['paths']['data_file']}") from err
 
-    # Missing data handling (F10): listwise deletion with informative logging
+    # Listwise deletion with informative logging
     n_before = len(df)
     df = df.dropna()
     n_dropped = n_before - len(df)
@@ -768,7 +768,7 @@ def create_model_and_param_dist(config, all_feature_names, active_covariate_name
         alpha_param: alpha_search,
     }
 
-    # Wire covariate_penalty_weights from config (F9 fix): only when covariates are active
+    # Wire covariate_penalty_weights from config: only when covariates are active
     if config['covariate_method'] != 'none' and cov_indices:
         cov_pw_cfg = model_cfg.get('covariate_penalty_weights', [1.0, 0.1, 0.01, 0.001])
         param_dist['cov_scaler__penalty_weight'] = cov_pw_cfg
@@ -940,9 +940,11 @@ def _compute_evaluation_metrics(Y_true, Y_pred, Y_prob, config, out_dir, is_loo=
 
 
 def run_nested_cv(config, X_brain, Y, weights, X_cov, active_covs, apriori_map=None):
-    """
-    Nested CV with fold-local feature reduction (F1 fix: reduction inside CV loop).
-    Returns the CV performance score.
+    """Run nested cross-validation with fold-local feature reduction.
+
+    Feature reduction is applied strictly inside the outer CV loop — fit on training
+    folds only — to prevent information leakage from test folds. Returns the CV
+    performance score (R² for regression, AUC-ROC for classification).
     """
     logging.info("--- Nested CV ---")
     outer = get_outer_cv(config)
@@ -962,7 +964,7 @@ def run_nested_cv(config, X_brain, Y, weights, X_cov, active_covs, apriori_map=N
         X_brain_te = X_brain.iloc[te].reset_index(drop=True)
         X_brain_tr_red, X_brain_te_red, fold_reducer = _apply_reducer_fold(reducer_template, X_brain_tr, X_brain_te)
 
-        # Save per-fold reducer outputs for transparency (Approach Y, T2 decision)
+        # Save per-fold reducer outputs for transparency
         if fold_reducer is not None:
             out_dir = config['paths']['output_dir']
             if hasattr(fold_reducer, 'get_loadings'):
@@ -1031,7 +1033,7 @@ def run_nested_cv(config, X_brain, Y, weights, X_cov, active_covs, apriori_map=N
         os.path.join(config['paths']['output_dir'], 'nested_cv_scores.csv'), index=False
     )
 
-    # Expanded evaluation metrics (C4)
+    # Compute expanded evaluation metrics post-hoc from outer CV predictions
     try:
         _compute_evaluation_metrics(
             Y_true, Y_pred,
@@ -1050,7 +1052,7 @@ def run_nested_cv(config, X_brain, Y, weights, X_cov, active_covs, apriori_map=N
 def _run_cv_fold_loop(X_brain, Y, X_cov, active_covs, config, seed, apriori_map=None):
     """Run full nested CV fold loop and return R²/AUC on concatenated outer-fold predictions.
 
-    Shared by _run_perm_task and _run_block_perm_task (F1 clean refactor).
+    Shared helper used by _run_perm_task and _run_block_perm_task.
     Callers prepare X_brain (possibly block-permuted) and Y (possibly shuffled)
     before invoking this helper.
 
@@ -1163,7 +1165,7 @@ def run_permutation_test(config, X_brain, Y, weights, X_cov, active_covs, actual
         )
 
 
-# --- Step 6: Selection Frequency (formerly Stability Selection, F7 rename) ---
+# --- Step 6: Selection Frequency ---
 def _fit_full_data_model(config, X_brain, Y, weights, X_cov, active_covs, apriori_map):
     """
     Shared setup for descriptive stages (selection frequency, bootstrap):
@@ -1227,7 +1229,7 @@ def _fit_full_data_model(config, X_brain, Y, weights, X_cov, active_covs, aprior
 def run_selection_frequency(config, X_brain, Y, weights, X_cov, active_covs, apriori_map=None):
     """Bootstrap selection frequency: a descriptive measure of feature inclusion robustness.
 
-    Approach Y (T5 decision): each subsample iteration fits a fresh reducer clone on
+    Approach Y: each subsample iteration fits a fresh reducer clone on
     the subsampled brain features, fits the model in reduced space with fixed
     hyperparameters (tuned on full data), back-projects selection indicators to the
     invariant original feature space using _backproject_coef_original_space.
@@ -1371,7 +1373,7 @@ def _boot_task(X_brain, Y, weights, seed, config, best_params, reducer_template,
     Y : pd.Series or pd.DataFrame
         Outcome variable(s).
     weights : pd.Series or None
-        Sample weights for weight-aware resampling (F13 fix).
+        Sample weights for weight-aware resampling.
     seed : int
         Random seed for this iteration.
     config : dict
@@ -1400,7 +1402,7 @@ def _boot_task(X_brain, Y, weights, seed, config, best_params, reducer_template,
     original_feature_names = list(X_brain.columns)
 
     try:
-        # Weight-aware bootstrap resampling (F13 fix)
+        # Weight-aware bootstrap resampling
         if weights is not None:
             p = weights.values / weights.values.sum()
             idx = rng_boot.choice(len(Y), len(Y), replace=True, p=p)
@@ -1600,7 +1602,7 @@ def _add_fdr_columns(df, pd_col='pd'):
 def _compute_importance_preamble(df_coef, all_feats, feat_std_map, config, best_model):
     """
     Compute shared statistics for all reduction methods: std/raw means, CIs, pd, is_significant.
-    F6 fix: accounts for CovariateScaler penalty_weight in raw coefficient conversion.
+    Accounts for CovariateScaler penalty_weight in raw coefficient conversion.
 
     Notes
     -----
@@ -1750,7 +1752,8 @@ def _report_none(df_coef, all_feats, stats, config, active_covs,
 def _compute_importance_report(df_coef, all_feats, feat_std_map, config, active_covs, reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model):
     """
     Dispatcher: compute shared statistics, then delegate to reduction-specific branch.
-    Applies BH-FDR correction (F4 fix). F6 fix preserved in preamble.
+    Applies BH-FDR correction at q=0.05. CovariateScaler penalty_weight adjustment
+    is applied in the preamble when feature_reduction_method is 'none'.
     """
     stats = _compute_importance_preamble(df_coef, all_feats, feat_std_map, config, best_model)
     red_method = config['feature_reduction_method']
@@ -1900,9 +1903,10 @@ def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, 
 
 # --- Step 8: Block Permutation ---
 def _run_block_perm_task(X_brain, X_block_cols, Y, X_cov, active_covs, config, seed, apriori_map=None):
-    """
-    Single block permutation iteration: shuffle block columns (rows), run full nested CV.
-    F2 fix: null uses full nested CV with shuffled block columns.
+    """Single block permutation iteration: shuffle block column rows, run full nested CV.
+
+    The null distribution uses the full nested CV score computed on the permuted
+    brain feature matrix, consistent with the observed score from run_nested_cv.
     """
     warnings.filterwarnings('ignore', category=ConvergenceWarning)
     rs = np.random.RandomState(seed)
@@ -1914,9 +1918,11 @@ def _run_block_perm_task(X_brain, X_block_cols, Y, X_cov, active_covs, config, s
 
 
 def run_block_perms(config, X_brain, Y, weights, X_cov, active_covs, actual_score, apriori_map=None):
-    """
-    Block permutation test. F2 fix: observed = nested CV score (passed as actual_score).
-    Null = full nested CV with shuffled block columns. Uses n_block_permutations config param.
+    """Run block-specific permutation tests to assess the incremental contribution of feature subsets.
+
+    The observed score is the nested CV score passed as actual_score. The null distribution
+    is constructed by running the full nested CV on versions of X_brain where the block
+    columns are row-permuted. Number of permutations is set by n_block_permutations in config.
     """
     logging.info("--- Block Permutation ---")
     blocks = config.get('block_permutation_tests')
@@ -1945,7 +1951,7 @@ def run_block_perms(config, X_brain, Y, weights, X_cov, active_covs, actual_scor
         results.append({'block': label, 'observed_score': actual_score, 'p_value': p_value})
         logging.info(f"Block '{label}': observed={actual_score:.4f}, p={p_value:.4f}")
 
-        # Save block permutation null distribution (C5)
+        # Save block permutation null distribution
         if config['stats_params'].get('save_distributions', True):
             pd.DataFrame({'null_score': null_scores}).to_csv(
                 os.path.join(config['paths']['output_dir'], f'block_perm_null_{label}.csv'),
@@ -1960,6 +1966,18 @@ def run_block_perms(config, X_brain, Y, weights, X_cov, active_covs, actual_scor
 
 
 def main():
+    """Entry point for the fmri-elastic-net pipeline.
+
+    Supports three execution modes controlled by --mode:
+    - 'main' (default): runs nested CV, selection frequency, bootstrap importance,
+      optional label-permutation test, and optional block permutation tests.
+    - 'perm_worker': runs a SLURM array worker subset of permutations and writes
+      perm_chunk_{job_id}.csv to the output directory.
+    - 'aggregate': collects all perm_chunk_*.csv files, computes the final
+      permutation p-value, and writes permutation_result.csv.
+
+    Required argument: --config (path to YAML configuration file).
+    """
     parser = argparse.ArgumentParser()
     parser.add_argument('--config')
     parser.add_argument('--mode', default='main')

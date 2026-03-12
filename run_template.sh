@@ -14,5 +14,6 @@ n_jobs=100 # should be able to divide this number by stats_params.n_permutations
 # ---------------------------
 # DO NOT EDIT BELOW HERE
 # ----------------------------
-sh /home/tjk33/project/fmri-elastic-net/run_fmri-elastic-net.sh \
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+sh "${SCRIPT_DIR}/run_fmri-elastic-net.sh" \
     ${config_path} ${slurm_log_path} ${mem_per_node_GB} ${cpus_per_task} ${n_jobs}

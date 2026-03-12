@@ -1,7 +1,7 @@
 # CONFIGURATION for PREDICTIVE MODELING with an ELASTIC NET
 
 # Analysis Type
-# "regression" (continuous outcome) or "classification" (binary outcome only, multi-class to come)
+# "regression" (continuous outcome) or "classification" (binary or multi-class outcome)
 analysis_type: "classification"
 
 # Analysis Mode:
@@ -54,7 +54,9 @@ data_cols:
     
   # Neural features to include in feature clustering (column label contains substring)
   # Ideally, ensure all features you want involved in clustering have been named "brain_{FEATURE_LABEL}"
-  brain_feature_substr: "brain" 
+  brain_feature_substr: "brain"
+
+  # sample_weight_col: null  # Optional: column of non-negative sample weights (ignored by MultiTaskElasticNet)
 
 # Clustering Parameters (Hierarchical, Density-Based Spatial Clustering of Applications with Noise [HDBSCAN])
 clustering_params:
@@ -62,8 +64,8 @@ clustering_params:
   # "auto" computes: max(3, ceil(log2(P) * (100/N)^0.25)) where P=features, N=samples
   # Or set an integer value directly (e.g. 2, 5, 10)
   # Singleton ("noise") features will be treated as their own cluster and passed to the model as raw feature.
-  # If a feature is its own cluster, its importance will be placed in report_cluster_importance.csv
-  # If a feature belongs to a cluster, its importance will be placed in report_individiual_importance.csv
+  # For cluster_pca: all feature importances (cluster PCs and singletons) appear in report_individual_importance.csv
+  # For apriori: cluster-level results appear in report_cluster_importance.csv; individual features in report_individual_importance.csv
   min_cluster_size: "auto"
 
   # Distance metric for computing feature similarity before clustering
@@ -73,8 +75,8 @@ clustering_params:
   distance_metric: "spearman"
 
   # How to convert similarity to distance
-  # "unsigned" - 1 - |sim| (treats positive and negative correlations equivalently)
-  # "signed"   - (1 - sim) / 2 (preserves sign: positively correlated features cluster together)
+  # "unsigned" - sqrt(2 * (1 - |sim|)) (treats positive and negative correlations equivalently)
+  # "signed"   - sqrt(2 * (1 - sim))  (preserves sign: positively correlated features cluster together)
   # Note: "signed" has no effect when distance_metric is "dcor" (dcor is always non-negative)
   sign_handling: "unsigned"
 

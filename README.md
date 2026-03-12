@@ -9,25 +9,12 @@ pattern (main analysis → permutation workers → aggregation).
 
 ## Overview
 
-The pipeline implements nested cross-validated elastic net regression or binary
-classification with optional feature dimensionality reduction (inside the CV loop
-to prevent data leakage). Statistical inference is based on bootstrap confidence
-intervals, probability of direction (pd), and Benjamini-Hochberg FDR correction.
-Block permutation testing quantifies the unique contribution of user-defined feature
-subsets (e.g., brain activation patterns).
-
-**Key design principles:**
-
-- All feature reduction is applied fold-locally inside the cross-validation loop.
-- Bootstrap importance uses Approach Y: each iteration fits a fresh reducer clone on
-  resampled brain features, fits the model in reduced space with fixed hyperparameters
-  (tuned on full data), then back-projects coefficients to the invariant original feature
-  space for aggregation (conditional bootstrap, Efron & Tibshirani, 1993). This ensures
-  meaningful CI and pd computation across iterations with different reduced spaces.
-- The `pd`-to-p-value conversion (`p = 2*(1 - pd)`) assumes a continuous coefficient
-  distribution; for high-sparsity features with L1 regularization, the CI-based
-  `is_significant` flag is the primary inference criterion and is unaffected by
-  zero-inflation. The p-value and FDR columns are complementary.
+The pipeline implements nested cross-validated elastic net regression or classification
+with optional feature dimensionality reduction applied fold-locally inside the CV loop
+to prevent data leakage. Two analysis modes are available to suit different sample sizes
+and inferential goals. Statistical inference is based on bootstrap confidence intervals,
+probability of direction (pd), and Benjamini-Hochberg FDR correction. Block permutation
+testing quantifies the unique contribution of user-defined feature subsets.
 
 ---
 
@@ -45,22 +32,39 @@ conda activate fmri-elastic-net
 
 ---
 
-## Usage
+## Quick Start
 
-### Local (single machine)
+### 1. Copy configuration and run templates
+
+```bash
+cp config_template.yaml my_project/config.yaml
+cp run_template.sh my_project/run.sh
+```
+
+### 2. Edit `config.yaml`
+
+At minimum, set:
+- `analysis_type`: `"regression"` or `"classification"`
+- `analysis_mode`: `"predict"` or `"correlate"` (see Analysis Modes below)
+- `covariate_method`: `"none"`, `"incorporate"`, or `"pre_regress"`
+- `feature_reduction_method`: `"none"`, `"cluster_pca"`, `"apriori"`, or `"ica"`
+- `paths.data_file`: absolute path to input CSV
+- `paths.output_dir`: absolute path to output directory
+- `cv_params.n_outer_folds`, `cv_params.n_inner_folds`: fold counts (or `"loo"`)
+- `cv_params.n_random_search_iter`: hyperparameter search iterations (no default; required)
+
+### 3. Run locally (single machine)
 
 ```bash
 python fmri-elastic-net.py --config /path/to/config.yaml
 ```
 
-### SLURM (recommended for large datasets)
+### 4. Run on SLURM (recommended for large datasets)
 
-1. Copy `run_template.sh` and `config_template.yaml` to your project directory.
-2. Edit paths and resource settings in both files.
-3. Submit:
+Edit `run.sh` to set paths and resource parameters, then submit:
 
 ```bash
-sh run_template.sh
+sh run.sh
 ```
 
 The orchestrator (`run_fmri-elastic-net.sh`) submits three dependent SLURM jobs:
@@ -68,113 +72,148 @@ The orchestrator (`run_fmri-elastic-net.sh`) submits three dependent SLURM jobs:
 | Stage | Job name | Description |
 |-------|----------|-------------|
 | 1 | `EN_Main` | Nested CV, selection frequency, bootstrap, block permutation |
-| 2 | `EN_Worker` (array) | Permutation null distribution (parallelized) |
+| 2 | `EN_Worker` (array) | Permutation null distribution (parallelized across array jobs) |
 | 3 | `EN_Agg` | Aggregates permutation chunks, computes final p-value |
 
 ---
 
-## Configuration
+## Data Format
 
-All options are controlled by a YAML configuration file. Copy `config_template.yaml`
-and edit the following required fields:
+The input data file must be a CSV with one row per subject. Required columns:
+- **Subject ID**: any string or integer identifier (specified by `data_cols.subject_id_col`)
+- **Outcome**: numeric continuous (regression) or integer class labels (classification); specified by `data_cols.post_score_col`
+- **Brain features**: numeric columns identified by a substring match (e.g., all columns named `brain_*`); specified by `data_cols.brain_feature_substr`
+- **Covariates** (optional): numeric columns; specified by `data_cols.covariate_cols`
 
-```yaml
-analysis_type:       "regression"        # or "classification"
-analysis_mode:       "predict"           # or "correlate"
-covariate_method:    "none"              # "none", "incorporate", or "pre_regress"
-feature_reduction_method: "none"         # "none", "cluster_pca", "apriori", or "ica"
-
-paths:
-  data_file:         "/absolute/path/to/data.csv"
-  output_dir:        "/absolute/path/to/output/"
-  apriori_clustering_file: null          # required only for feature_reduction_method: "apriori"
-
-cv_params:
-  n_outer_folds:     10
-  n_inner_folds:     3
-  n_inner_repeats:   5
-  n_random_search_iter: 20              # REQUIRED; no default
-
-stats_params:
-  n_permutations:       10000
-  n_bootstraps:         10000
-  n_block_permutations: 500
-  ci_level:             0.95
-  save_distributions:   true            # saves .npz bootstrap array and block perm null CSVs
-```
-
-See `config_template.yaml` and `INPUT_SPECIFICATION.md` for all parameters with
-descriptions, defaults, and valid ranges.
-
----
-
-## Outputs
-
-All output files are written to `paths.output_dir`:
-
-| File | Description |
-|------|-------------|
-| `nested_cv_scores.csv` | Observed model performance score (R² or AUC) |
-| `permutation_null_distribution_{metric}.csv` | Null distribution from label permutation |
-| `permutation_result.csv` | Observed score, p-value, n_permutations (aggregate mode) |
-| `report_selection_frequency.csv` | Bootstrap selection probability per feature/component |
-| `report_feature_importance.csv` | Bootstrap CIs, pd, FDR flags (feature_reduction: none) |
-| `report_cluster_importance.csv` | Bootstrap CIs, pd, FDR flags (apriori clusters) |
-| `report_individual_importance.csv` | Back-projected feature-level importance (apriori, cluster_pca, ica) |
-| `report_block_permutation.csv` | Block-specific observed score and p-value |
-| `cluster_loadings.csv` | PCA loadings per cluster (cluster_pca or apriori) |
-| `ica_mixing_matrix.csv` | ICA mixing matrix A (P × K), activation pattern basis |
-| `model_performance.csv` | Comprehensive evaluation metrics (RMSE, MAE, R², Pearson r for regression; AUC-ROC, Log-Loss, Sensitivity, Specificity for classification) |
-| `confusion_matrix.csv` | Confusion matrix (multi-class classification only) |
-| `bootstrap_coef_distribution.npz` | Full bootstrap coefficient array as compressed NumPy archive (when `save_distributions: true`) |
-| `block_perm_null_{label}.csv` | Block-specific permutation null scores (when `save_distributions: true`) |
-| `cluster_loadings_fold_{n}.csv` | Per-fold PCA loadings (cluster_pca or apriori; one file per outer fold) |
-| `ica_mixing_matrix_fold_{n}.csv` | Per-fold ICA mixing matrix (ica; one file per outer fold) |
-| `report_{level}_plotting.csv` | Subject-level feature vs. outcome data for visualization |
-| `pipeline.log` | Full logging output with timing and diagnostics |
+Rows with any missing values are removed by listwise deletion before analysis.
 
 ---
 
 ## Analysis Modes
 
-**`predict`** (LASSO-heavy elastic net):
-Uses high L1 ratios (0.5–0.99). Model performance evaluated via external validity
-(nested CV). Appropriate for large samples (N ~ 1000s) where generalization is
-the primary question.
+Choosing the right analysis mode is the most consequential configuration decision.
+It controls both the L1 ratio search space and the implicit regularization philosophy.
 
-**`correlate`** (Ridge-heavy elastic net):
-Uses low L1 ratios (0.001–0.2). Model performance evaluated via internal validity.
-More appropriate for small samples (N ~ 100s). Feature importance based on
-bootstrap coefficients rather than sparsity.
+### `predict` — LASSO-dominant elastic net
+
+- L1 ratio search space: 0.5–0.99 (sparse, feature-selecting solutions)
+- Model performance evaluated via external validity (nested CV R² or AUC)
+- Emphasis on generalization and sparsity
+- **Best use case:** large samples (N ~ 1,000s) where generalization to unseen data
+  is the primary scientific question; high-dimensional feature sets where true sparsity
+  is expected; feature selection as an objective in itself
+
+### `correlate` — Ridge-dominant elastic net
+
+- L1 ratio search space: 0.001–0.2 (dense, shrinkage-focused solutions)
+- Model performance evaluated via internal validity
+- Emphasis on stable coefficient estimation and multicollinear feature sets
+- **Best use case:** small-to-medium samples (N ~ 100s) where overfitting is a concern;
+  brain connectivity/activation data with high inter-feature correlation; scenarios where
+  interpretability of all features is desired rather than sparse selection
+
+---
+
+## Covariate Methods
+
+| Method | Description | Best use case |
+|--------|-------------|---------------|
+| `none` | No covariates included | No nuisance variables to control |
+| `incorporate` | Covariates entered as features with tunable penalty weight | Covariates are substantively interesting predictors alongside brain features |
+| `pre_regress` | Outcome residualized on covariates fold-locally before prediction | Covariates are pure nuisance variables; their unique contribution should be removed |
+
+When `incorporate` is used, a `covariate_penalty_weight` hyperparameter is searched
+over the `model_params.covariate_penalty_weights` list to modulate regularization
+applied to covariate columns relative to brain features.
 
 ---
 
 ## Feature Reduction Methods
 
-| Method | Description | Use case |
-|--------|-------------|----------|
-| `none` | Raw features passed directly to model | Small–medium feature sets |
-| `cluster_pca` | HDBSCAN clustering + 1-component PCA per cluster (fit inside CV) | Questionnaire, genomic data |
-| `apriori` | External cluster map + 1-component PCA per cluster (fit inside CV) | Pre-defined brain networks |
-| `ica` | FastICA decomposition (fit inside CV); back-projection via activation patterns per Haufe et al. (2014) | Brain activation/connectivity data with overlapping networks |
+All reduction is applied fold-locally inside the CV loop to prevent data leakage.
+
+| Method | Description | Best use case |
+|--------|-------------|---------------|
+| `none` | Raw features passed directly to model | Small–medium feature sets; no assumed structure |
+| `cluster_pca` | HDBSCAN clustering + 1-component PCA per cluster (fit inside CV) | Questionnaire items, genomic data, or any features expected to form discrete non-overlapping groups |
+| `apriori` | Externally-defined cluster map + 1-component PCA per cluster (fit inside CV) | Pre-defined brain networks (e.g., atlas-based parcellation); network structure is theoretically motivated |
+| `ica` | FastICA decomposition (fit inside CV); back-projection via activation patterns (Haufe et al., 2014) | Brain activation or connectivity data where regions participate in multiple overlapping networks |
+
+**Note on leakage prevention:** For the inferential nested CV stage, reduction is
+strictly fold-local (fit on training data only). For the descriptive reporting stages
+(selection frequency, bootstrap importance), reduction is fit on the full dataset; a
+log message explicitly flags this distinction.
 
 ---
 
 ## Statistical Inference
 
-**Feature significance** is determined by the bootstrap CI for the standardized
-coefficient not crossing zero (`is_significant`). Significance after BH-FDR
-correction is reported in `is_significant_fdr`.
+### Model performance p-value
+Label permutation test: the full nested CV is repeated `n_permutations` times with
+shuffled outcome labels. P-value uses Laplace correction:
+`(count(null ≥ observed) + 1) / (n_permutations + 1)`.
 
-**Probability of direction** (`pd`) is the proportion of bootstrap samples with
-the same sign as the mean coefficient. The p-value approximation `p = 2*(1 - pd)`
-follows Makowski et al. (2019). For sparse features where many bootstrap samples
-produce exactly zero, `pd` may fall below 0.5 (yielding `p = 1.0` after clipping);
-in such cases, `is_significant` from the CI remains the valid primary criterion.
+### Feature importance
+Bootstrap confidence intervals (Approach Y conditional bootstrap): each iteration fits
+a fresh reducer clone on resampled brain features, fits the model using hyperparameters
+fixed from full-data tuning, and back-projects coefficients to the original feature
+space for aggregation. This ensures meaningful CI and pd computation across iterations
+with different reduced spaces.
 
-**Block permutation tests** assess the unique contribution of a feature block by
-permuting that block's rows and rerunning the full nested CV. Each block's null
-distribution is generated independently.
+- **`is_significant`**: primary criterion — CI does not cross zero
+- **`is_significant_fdr`**: survives Benjamini-Hochberg FDR correction at q = 0.05
+- **`pd`**: probability of direction; p-value approximation `p = 2*(1 - pd)` assumes
+  a continuous coefficient distribution. For sparse features with high L1 regularization,
+  zero-inflated bootstrap distributions cause `pd` to be near 0.5; use `is_significant`
+  as the primary criterion in that case.
+
+### Selection frequency
+Repeated 50% subsampling (`n_bootstraps` iterations). Per feature: proportion of
+iterations with a non-zero coefficient. Descriptive only — no significance threshold.
+
+### Block permutation
+For each user-defined feature block: only that block's columns are row-permuted and
+the full nested CV is rerun. Quantifies the unique predictive contribution of a feature
+subset (e.g., activation from a specific brain region) beyond the remaining features.
+
+---
+
+## Output Files
+
+All output files are written to `paths.output_dir`:
+
+| File | Description |
+|------|-------------|
+| `nested_cv_scores.csv` | Observed model performance (R² or AUC) |
+| `model_performance.csv` | Comprehensive evaluation metrics (regression: RMSE, MAE, R², Pearson r; classification: AUC-ROC, Log-Loss, Sensitivity, Specificity, Balanced Accuracy) |
+| `confusion_matrix.csv` | Confusion matrix (multi-class classification only) |
+| `permutation_null_distribution_{metric}.csv` | Null distribution from label permutation |
+| `permutation_result.csv` | Observed score, p-value, n_permutations (aggregate mode) |
+| `report_selection_frequency.csv` | Subsampling-based selection frequency per feature/component |
+| `report_feature_importance.csv` | Bootstrap CIs, pd, FDR flags (`feature_reduction_method: none`) |
+| `report_cluster_importance.csv` | Bootstrap CIs, pd, FDR flags at cluster level (`apriori`) |
+| `report_individual_importance.csv` | Back-projected feature-level importance (`apriori`, `cluster_pca`, `ica`) |
+| `report_block_permutation.csv` | Block-specific observed score and p-value |
+| `cluster_loadings.csv` | PCA loadings per cluster (`cluster_pca` or `apriori`) |
+| `cluster_loadings_fold_{n}.csv` | Per-fold PCA loadings for transparency |
+| `ica_mixing_matrix.csv` | ICA mixing matrix A (P × K), activation pattern basis |
+| `ica_mixing_matrix_fold_{n}.csv` | Per-fold ICA mixing matrix for transparency |
+| `report_{level}_plotting.csv` | Subject-level feature vs. outcome data for visualization |
+| `bootstrap_coef_distribution.npz` | Full bootstrap coefficient array (when `save_distributions: true`) |
+| `block_perm_null_{label}.csv` | Block-specific permutation null scores (when `save_distributions: true`) |
+| `pipeline.log` | Full logging output with timing and diagnostics |
+
+For multi-task regression or multi-class classification, per-task/per-class output
+files are written to `output_dir/task_{label}/` subdirectories, with aggregate
+summaries written to the top-level `output_dir`.
+
+---
+
+## Configuration Reference
+
+See `config_template.yaml` for all parameters with inline comments and defaults.
+See `INPUT_SPECIFICATION.md` for the complete exhaustive specification including
+parameter types, ranges, constraints, output schemas, and known edge cases.
 
 ---
 
@@ -191,19 +230,7 @@ distribution is generated independently.
   the back-projected standardized coefficient is divided by original-feature SD, which
   is not equivalent to a standardized beta from direct regression on original features.
   `std_coef_mean` and `pd` are the primary inferential quantities.
-- Selection frequency magnitudes may be systematically inflated because hyperparameters
+- Selection frequency magnitudes may be systematically elevated because hyperparameters
   are fixed from full-N tuning while each subsample uses N/2. Relative ordering is
   preserved; no significance threshold is applied (purely descriptive).
 - LOO cross-validation disables `n_inner_repeats` (repeated CV is undefined for LOO).
-
----
-
-## Testing
-
-```bash
-cd /path/to/fmri-elastic-net
-conda activate fmri-elastic-net
-pytest tests/ -v
-```
-
-Test suite: 418 tests across the `tests/` directory.

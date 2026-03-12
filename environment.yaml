@@ -3,7 +3,7 @@ channels:
   - conda-forge
   - defaults
 # Versions pinned to minor release (=X.Y.*) to allow patch-level security updates
-# while preserving API compatibility. Tested against 314/314 tests.
+# while preserving API compatibility. Tested against 418/418 tests.
 dependencies:
   - python=3.10
   - pip

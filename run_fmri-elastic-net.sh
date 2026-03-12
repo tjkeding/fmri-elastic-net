@@ -3,11 +3,11 @@
 # =================================================================
 # MASTER SLURM ORCHESTRATOR FOR ELASTIC NET PIPELINE
 # Assumptions:
-# 1. ALWAYS uses psych_week unless PARTITION is changed below
-# 2. Read access to /home/tjk33/project directory
+# 1. PARTITION variable below is set to your cluster's partition name
+# 2. ENV_SETUP below is updated with any module load commands required by your HPC environment
 # 3. Access to fmri-elastic-net conda environment (create with environment.yaml)
 
-# Last updated: 01/30/2026
+# Last updated: 03/12/2026
 # =================================================================
 
 # ARGUMENT PARSING
@@ -23,13 +23,16 @@ CPUS_PER_TASK="$4"
 N_JOBS="$5"
 
 # SETUP VARIABLES
-PYTHON_SCRIPT="/home/tjk33/project/fmri-elastic-net/fmri-elastic-net.py"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PYTHON_SCRIPT="${SCRIPT_DIR}/fmri-elastic-net.py"
 MEM_PER_NODE="${MEM_INT}G"
-PARTITION="psych_week"
+PARTITION="YOUR_PARTITION"  # TODO: set to your SLURM partition name
 TIME_LIMIT="07-00:00:00"
 
 # ENVIRONMENT SETUP
-ENV_SETUP="module load StdEnv && module load miniconda && conda activate fmri-elastic-net"
+# TODO: prepend any module load commands required by your HPC environment
+#       e.g. "module load miniconda && conda activate fmri-elastic-net"
+ENV_SETUP="conda activate fmri-elastic-net"
 mkdir -p "$LOG_DIR"
 
 echo "-----------------------------------------------------------"
