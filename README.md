@@ -251,9 +251,8 @@ All output files are written to `paths.output_dir`:
 | `permutation_null_distribution_{metric}.csv` | Null distribution from label permutation |
 | `permutation_result.csv` | Observed score, p-value, n_permutations (aggregate mode) |
 | `report_selection_frequency.csv` | Subsampling-based selection frequency per feature/component |
-| `report_feature_importance.csv` | Bootstrap CIs, pd, FDR flags (`feature_reduction_method: none`) |
+| `report_feature_importance.csv` | Bootstrap CIs, pd, FDR flags per feature/component (all `feature_reduction_method` values) |
 | `report_cluster_importance.csv` | Bootstrap CIs, pd, FDR flags at cluster level (`apriori`) |
-| `report_individual_importance.csv` | Back-projected feature-level importance (`apriori`, `cluster_pca`, `ica`) |
 | `report_block_permutation.csv` | Block-specific observed score and p-value |
 | `report_fold_ensemble_importance.csv` | Tier 1 inference: fold-wise t-test mean/SD/CV, t-statistic, p-value, CI, and significance flags per feature |
 | `report_fold_diagnostics.csv` | Per-fold hyperparameter records (alpha/C, l1_ratio, penalty_weight) from nested CV |

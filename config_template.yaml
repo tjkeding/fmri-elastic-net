@@ -69,8 +69,8 @@ clustering_params:
   # "auto" computes: max(3, ceil(log2(P) * (100/N)^0.25)) where P=features, N=samples
   # Or set an integer value directly (e.g. 2, 5, 10)
   # Singleton ("noise") features will be treated as their own cluster and passed to the model as raw feature.
-  # For cluster_pca: all feature importances (cluster PCs and singletons) appear in report_individual_importance.csv
-  # For apriori: cluster-level results appear in report_cluster_importance.csv; individual features in report_individual_importance.csv
+  # For cluster_pca: all feature importances (cluster PCs and singletons) appear in report_feature_importance.csv
+  # For apriori: cluster-level results appear in report_cluster_importance.csv; individual features in report_feature_importance.csv
   min_cluster_size: "auto"
 
   # Distance metric for computing feature similarity before clustering

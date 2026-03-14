@@ -443,9 +443,9 @@ as part of `main` mode; not skippable.
 
 **Output files by `feature_reduction_method`:**
 - `none`: `report_feature_importance.csv`
-- `cluster_pca`: `report_individual_importance.csv`, `cluster_loadings.csv`
-- `apriori`: `report_cluster_importance.csv`, `report_individual_importance.csv`, `cluster_loadings.csv`
-- `ica`: `report_individual_importance.csv`, `ica_mixing_matrix.csv`
+- `cluster_pca`: `report_feature_importance.csv`, `cluster_loadings.csv`
+- `apriori`: `report_cluster_importance.csv`, `report_feature_importance.csv`, `cluster_loadings.csv`
+- `ica`: `report_feature_importance.csv`, `ica_mixing_matrix.csv`
 - All methods: `report_{cluster|individual}_plotting.csv` (subject-level visualization data for significant features)
 - When `save_distributions: true`: `bootstrap_coef_distribution.npz`
 - Always: `report_fold_bootstrap_ci.csv` (Tier 2 percentile CIs, pooled across all K folds)
@@ -527,9 +527,7 @@ permutation test or `aggregate` mode.
 | `p_value` | float | Approximate p-value from pd: `clip(2*(1-pd), 0, 1)` |
 | `is_significant_fdr` | bool | Survives BH-FDR correction at q = 0.05 |
 
-### `report_individual_importance.csv`
-Same schema as `report_feature_importance.csv` with column `feature` (original feature name).
-For `apriori` and `cluster_pca`, also includes `source_cluster` (cluster label to which the feature belongs).
+For `apriori` and `cluster_pca`, `report_feature_importance.csv` also includes `source_cluster` (cluster label to which the feature belongs).
 
 ### `report_block_permutation.csv`
 | Column | Type | Description |

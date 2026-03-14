@@ -2071,7 +2071,7 @@ def _compute_importance_preamble(df_coef, all_feats, feat_std_map, config):
 
 def _report_apriori(df_coef, all_feats, stats, config, active_covs,
                     reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model):
-    """Apriori: individual feature report + network-level aggregation via apriori cluster map.
+    """Apriori: feature-level report (report_feature_importance.csv) + network-level aggregation via apriori cluster map.
 
     With per-iteration re-reduction, df_coef is in original brain feature space. Network-level
     statistics are produced by aggregating individual feature bootstrap distributions
@@ -2082,7 +2082,7 @@ def _report_apriori(df_coef, all_feats, stats, config, active_covs,
 
     # --- Individual feature report (df_coef is in original brain feature space after per-iteration back-projection) ---
     indiv_df = _build_individual_report_df(all_feats, stats)
-    indiv_df.to_csv(os.path.join(out_dir, 'report_individual_importance.csv'), index=False)
+    indiv_df.to_csv(os.path.join(out_dir, 'report_feature_importance.csv'), index=False)
 
     # --- Network-level report: aggregate to cluster via apriori map ---
     try:
@@ -2122,10 +2122,10 @@ def _report_standard(df_coef, all_feats, stats, config, active_covs,
                      reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model):
     """Standard importance report for none, cluster_pca, and ica reduction methods.
 
-    Writes report_feature_importance.csv (none) or report_individual_importance.csv
-    (cluster_pca, ica) and calls calculate_visualization_data. For ica, also saves
-    the full-data mixing matrix for transparency. For cluster_pca, renames 'feature'
-    to 'cluster_id' in the visualization call to match the expected column name.
+    Writes report_feature_importance.csv for all reduction methods and calls
+    calculate_visualization_data. For ica, also saves the full-data mixing matrix
+    for transparency. For cluster_pca, renames 'feature' to 'cluster_id' in the
+    visualization call to match the expected column name.
 
     With per-iteration re-reduction, df_coef is already in original brain feature space
     after back-projection in each bootstrap iteration — report directly.
@@ -2143,13 +2143,12 @@ def _report_standard(df_coef, all_feats, stats, config, active_covs,
         mixing_df.to_csv(os.path.join(out_dir, 'ica_mixing_matrix.csv'))
 
     indiv_df = _build_individual_report_df(all_feats, stats)
+    indiv_df.to_csv(os.path.join(out_dir, 'report_feature_importance.csv'), index=False)
 
     if red_method == 'none':
-        indiv_df.to_csv(os.path.join(out_dir, 'report_feature_importance.csv'), index=False)
         calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_model,
                                      indiv_df, 'individual', None)
     else:
-        indiv_df.to_csv(os.path.join(out_dir, 'report_individual_importance.csv'), index=False)
         vis_df = indiv_df.rename(columns={'feature': 'cluster_id'}) if red_method == 'cluster_pca' else indiv_df
         calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_model,
                                      vis_df, 'individual', X_brain)
