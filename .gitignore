@@ -10,3 +10,8 @@
 !README.md
 !run_fmri-elastic-net.sh
 !run_template.sh
+
+# AID Framework disclosure
+!AID_LOG.md
+!.aid/
+!.aid/**

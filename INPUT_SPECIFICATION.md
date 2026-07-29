@@ -152,6 +152,8 @@ and block permutation fold loops to avoid nested parallelism with the outer
 | `data_cols.covariate_cols` | list of str | Only when `covariate_method != "none"` | Covariate column names |
 | `data_cols.brain_feature_substr` | str | Yes | Substring match to identify brain feature columns |
 | `data_cols.sample_weight_col` | str or null | No | Optional sample weight column name |
+| `data_cols.moderator_col` | str or null | No | Optional column name for a moderating variable (brain x moderator interactions). When non-null, `moderator_type` is required |
+| `data_cols.moderator_type` | str or null | Only when `moderator_col` is non-null | `"continuous"` or `"nominal"`. Determines coding scheme: continuous = mean-centered on fold-local training-split mean; nominal = deviation (effect) coded relative to the last sorted level |
 
 ### `clustering_params` Section (used only when `feature_reduction_method: "cluster_pca"`)
 
@@ -245,6 +247,7 @@ for single-sample folds). `n_inner_repeats` is silently ignored for LOO inner CV
 | `stats_params.n_block_permutations` | int | `500` | Integer ≥ 1 | Permutations per block in block permutation tests. Typical range: 100–1000 |
 | `stats_params.ci_level` | float | `0.95` | (0.0, 1.0) | Confidence level for bootstrap CIs. Also used as percentile threshold for Parallel Analysis eigenvalue comparison |
 | `stats_params.save_distributions` | bool | `true` | `true`, `false` | If `true`, saves the full bootstrap coefficient array (`bootstrap_coef_distribution.npz`) and per-block permutation null scores (`block_perm_null_{label}.csv`). Set to `false` if storage is constrained |
+| `stats_params.bootstrap_ci_method` | str | `"partial_ridge"` | `"partial_ridge"`, `"percentile"` | Bootstrap CI construction method for Tier 2 inference. `"partial_ridge"`: split estimator (Liu et al., 2020) that eliminates zero-inflation by refitting selected features with OLS/unpenalized logistic and unselected features with Ridge. `"percentile"`: standard percentile CIs with no correction. A warning is emitted if `"percentile"` is used with `analysis_mode: "predict"` |
 
 ### `block_permutation_tests` Section (optional)
 
@@ -286,7 +289,12 @@ Block permutation p-values use a one-sided Laplace-corrected test:
 - Stores `{N, P_brain, ceiling, np_ratio, apriori_map}` in `config['_runtime']`.
 - Does NOT apply any feature reduction; all reduction is deferred to CV loops.
 
-**Output:** No files. Returns `(X_brain, X_cov, Y, weights, subj_ids, active_covs, apriori_map)`.
+- Loads moderator column if `data_cols.moderator_col` is non-null. Validates column
+  existence in the data. For nominal moderators, validates that K-1 < n_outer_folds
+  (Hotelling's T-squared invertibility requirement). Returns moderator as a dict with
+  keys `series` (pd.Series), `type` (str), and `K` (int for nominal, None for continuous).
+
+**Output:** No files. Returns `(X_brain, X_cov, Y, weights, subj_ids, active_covs, apriori_map, moderator)`.
 
 ### Step 2: Feature Reduction Transformers (fold-local, inside CV)
 
@@ -319,14 +327,63 @@ refit independently per CV fold (or per bootstrap/subsample iteration).
 reducers are fit on the full dataset. A log message explicitly flags this distinction
 from the fold-local inferential pathway.
 
+### Step 2b: Interaction Modeling Helpers (fold-local, inside CV)
+
+When `moderator_col` is specified, the following helper functions construct interaction
+terms post-reduction within each fold, bootstrap iteration, or subsample iteration.
+
+**`_code_moderator(moderator_series, moderator_type, train_idx, levels_override=None)`:**
+Codes the moderator variable fold-locally. For continuous moderators: centers on the
+training-split mean. For nominal moderators: applies deviation (effect) coding where each
+non-reference level gets +1 in its contrast column and the reference (last sorted level)
+gets -1 in all contrast columns. Unseen test levels receive all-zero contrast rows.
+When `levels_override` is provided (bootstrap and selection frequency paths), the override
+list is used instead of deriving levels from `train_idx`, ensuring consistent K-1 coding
+dimensions across resampled iterations where some levels may be absent.
+
+**`_construct_interactions(X_reduced_brain, moderator_coded)`:**
+Constructs element-wise products: each brain feature column is multiplied by each moderator
+column. Output shape: (N, n_reduced * n_mod_cols). Column naming: `{brain_col}_x_{mod_col}`.
+
+**`_strip_protected(c, n_covs, n_moderator_cols, n_reduced)`:**
+Partitions the coefficient array into brain main-effect and interaction blocks by stripping
+covariate and moderator columns. Returns `(c_brain_main, c_brain_interaction)` where
+`c_brain_interaction` is None when no moderator is specified.
+
+**`_partial_ridge_refit(X, Y, selected_mask, config, weights, n_covs, n_moderator_cols)`:**
+Partial Ridge refit (Liu et al., 2020) for debiased bootstrap CIs. Selected features
+receive OLS (regression) or logistic with sqrt(n) column scaling and C=1 (classification).
+Unselected features receive Ridge shrinkage (lambda = 1/n for regression, standard L2 for
+classification). Covariates and moderator columns are forced into the selected set.
+For classification, the Firth-penalized logistic fallback (`_firth_logistic`) is triggered
+when any selected-feature coefficient exceeds 10.0 log-odds (separation detection).
+
+**`_hotelling_t2(coef_matrix, ci_level)`:**
+Hotelling's T-squared omnibus test for K>2 nominal moderator Tier 1 inference. Tests
+H0: the multivariate mean of fold-level contrast coefficient vectors equals zero.
+Converts T-squared to F-statistic with df1 = p_dim, df2 = n_folds - p_dim. Guards:
+returns NaN dict when df2 <= 0 or the covariance matrix is rank-deficient.
+
+**`_firth_logistic(X, y, max_iter, tol)`:**
+Firth-penalized logistic regression via iteratively reweighted least squares (IRLS).
+Adds a Jeffreys prior penalty (Firth, 1993) to address complete or quasi-complete
+separation. Self-contained implementation (no external fitting library). Returns
+`(beta, intercept, converged)`.
+
 ### Step 3: Model and Hyperparameter Distribution (`create_model_and_param_dist`)
 
-Constructs an sklearn `Pipeline` with three steps:
+Constructs an sklearn `Pipeline` with five steps:
 1. `StandardScaler` (step name `scaler`) — standardizes all features to zero mean/unit variance
-2. `CovariateScaler` (step name `cov_scaler`) — scales covariate columns by `1/penalty_weight`
+2. `WeightTransformer` (step name `weight_transformer`) — scales X (and Y) by sqrt(w_i) for
+   multi-task weighted regression. No-op for all other configurations; included for consistent
+   pipeline step naming.
+3. `CovariateScaler` (step name `cov_scaler`) — scales covariate columns by `1/penalty_weight`
    before they enter the elastic net. A `penalty_weight < 1.0` reduces regularization on covariates
    relative to brain features (covariate-privileged). `penalty_weight = 1.0` is a no-op.
-3. Estimator (step name `model`):
+4. `ModeratorScaler` (step name `mod_scaler`) — scales moderator columns by 1/0.001 (1000x
+   amplification) to protect the moderator main effect from regularization. No-op when no
+   moderator is specified. Uses a fixed scale factor (not tuned via RandomizedSearchCV).
+5. Estimator (step name `model`):
    - `ElasticNet(max_iter=10000, selection='random')` — single-output regression
    - `MultiTaskElasticNet(max_iter=10000, selection='random')` — multi-output regression
    - `LogisticRegression(penalty='elasticnet', solver='saga', max_iter=5000)` — classification
@@ -353,6 +410,11 @@ Primary performance metric:
   (`covariate_indices = range(n_covariates)`)
 - When `covariate_method: "pre_regress"`: outcome residualized on covariates fold-locally
   via `_local_residualize` (nuisance regression strictly within fold)
+- When `moderator_col` is specified: moderator is coded fold-locally via `_code_moderator`
+  (training-set-derived levels/mean); interactions are constructed post-reduction via
+  `_construct_interactions`; moderator main effect columns are prepended (protected by
+  `ModeratorScaler`); interaction columns are appended. Feature matrix layout:
+  `[covariates | moderator main effect(s) | brain features | brain x moderator interactions]`
 
 **Inner loop** (hyperparameter tuning):
 - `RandomizedSearchCV` with `n_random_search_iter` iterations
@@ -378,6 +440,10 @@ as part of `main` mode; not skippable.
   (H0: mean fold coefficient = 0)
 - Computes fold mean, SD, and CV (unsigned: |SD/mean|; NaN when |mean| ≤ 1e-30)
 - t-based CI at `ci_level` using dof = K − 1; FDR correction via BH at q = 0.05
+- For K>2 nominal moderator interactions: Hotelling's T-squared omnibus test across the
+  K-1 contrast coefficients per brain feature (`_hotelling_t2`). Guards: returns NaN when
+  df2 = n_folds - n_contrasts <= 0 or the fold-level covariance matrix is rank-deficient.
+  Per-contrast t-tests and Tier 2 L2-norm CIs remain valid in those degenerate cases.
 - Per-fold hyperparameter diagnostics (alpha/C, l1_ratio, penalty_weight) and summary
   statistics (mean ± SD, min, max across K folds) also written here
 
@@ -406,8 +472,11 @@ as part of `main` mode; not skippable.
 - Per iteration (`_subsample_iter`):
   1. Subsample 50% of subjects without replacement using fold-specific indices
   2. Fit fresh reducer clone on subsampled brain features (per-iteration re-reduction)
-  3. Fit model with fold-specific `best_params` (fixed hyperparameters — no re-tuning)
-  4. Back-project `coef_ != 0` indicators to original feature space via
+  3. When moderator is specified: code moderator via `_code_moderator` with
+     `levels_override=full_sample_levels` (nominal) to ensure consistent coding dimensions;
+     construct interactions post-reduction
+  4. Fit model with fold-specific `best_params` (fixed hyperparameters — no re-tuning)
+  5. Back-project `coef_ != 0` indicators to original feature space via
      `_backproject_coef_original_space`
 - Aggregation: mean of binary non-zero indicators across all iterations = selection probability
 - Multi-output: per-task files written to `output_dir/task_{label}/`; union aggregate
@@ -424,9 +493,21 @@ as part of `main` mode; not skippable.
   1. Weight-aware bootstrap resample with replacement (uses normalized `weights` probability
      vector if `sample_weight_col` is specified)
   2. Fit fresh reducer clone on resampled brain features (per-iteration re-reduction)
-  3. Fit model with fold-specific `best_params` (no re-tuning); catch `ConvergenceWarning`
-  4. Back-project coefficients to original brain feature space via
+  3. When moderator is specified: code moderator via `_code_moderator` with
+     `levels_override=full_sample_levels` (nominal) to ensure consistent coding dimensions;
+     construct interactions post-reduction
+  4. Fit model with fold-specific `best_params` (no re-tuning); catch `ConvergenceWarning`
+  5. Back-project coefficients to original brain feature space via
      `_backproject_coef_original_space`
+  6. When `bootstrap_ci_method: "partial_ridge"`: apply Partial Ridge refit via
+     `_partial_ridge_refit`. For regression: selected features receive OLS, unselected
+     features receive Ridge (lambda = 1/n). For classification: selected features scaled
+     by sqrt(n) with fixed C=1 logistic regression, then back-transformed by multiplying
+     by sqrt(n); unselected features receive standard L2. Covariates and moderator columns
+     are forced into the selected set. Firth-penalized logistic regression
+     (`_firth_logistic`) is applied as a fallback when complete separation is detected
+     (any selected-feature coefficient exceeds 10.0 log-odds).
+  7. Returns 4-tuple: (c_original_main, c_original_interaction, converged, firth_used)
 - Results pooled across all K folds for Tier 2 percentile CIs (`report_fold_bootstrap_ci.csv`)
 - Failed iterations (exception raised) return `None` and are excluded; a warning is
   logged if > 5% of iterations fail
@@ -700,3 +781,11 @@ sh run_fmri-elastic-net.sh <CONFIG_PATH> <LOG_DIR> <MEM_GB> <CPUS_PER_TASK> <N_J
 | LOO with classification | `StratifiedKFold` is used for non-LOO; `LeaveOneOut` cannot stratify. With very small N, class proportions per fold may be unbalanced |
 | Spearman distance for P = 2 | `scipy.stats.spearmanr` returns a scalar correlation for two columns; the code explicitly converts this to a 2×2 matrix |
 | NaN similarity values | Constant features produce undefined correlation; treated as zero similarity (maximum distance = `sqrt(2)`) before HDBSCAN |
+| Nominal moderator K-1 >= n_outer_folds | `ValueError` raised at load time. Hotelling's T-squared requires df2 = n_folds - (K-1) > 0 for the F-distribution to be defined |
+| Hotelling T-squared df2 <= 0 at runtime | Returns NaN dict with a warning. Occurs when n_folds <= n_contrasts after any fold exclusion. Per-contrast t-tests and Tier 2 L2-norm CIs remain valid |
+| Hotelling T-squared rank-deficient covariance | Returns NaN dict with a warning. Occurs when fold-level coefficient vectors are collinear. Triggered by duplicated contrast columns or degenerate fold splits |
+| Partial Ridge separation detection | When any selected-feature coefficient exceeds 10.0 log-odds (absolute value), Firth-penalized logistic regression is applied as a fallback for classification. Convergence status tracked and logged |
+| Multi-output `selected_mask` dimensionality | For multi-task/multi-class, `selected_mask` is collapsed to 1D via `np.any` union across outputs (a feature is selected if non-zero in any task/class) |
+| Nominal moderator level missing from resample | Bootstrap and selection frequency paths use `levels_override` (full-sample level set) to ensure consistent K-1 coding dimensions across resampled iterations. Unseen levels in a given resample produce all-zero contrast rows |
+| Logistic Partial Ridge back-transformation | Selected-feature coefficients are back-transformed by multiplying by sqrt(n), not dividing. This is a project-specific extension of Liu et al. (2020); see Known Limitations in README |
+| Multi-task/multi-class interaction reporting | Interaction Tier 1, Tier 2, and selection frequency output files are not yet implemented for multi-task regression or multi-class classification. Coefficients are computed correctly but not written to interaction-specific output files |

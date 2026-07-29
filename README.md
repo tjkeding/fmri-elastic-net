@@ -184,6 +184,65 @@ full pipeline.
 
 ---
 
+## Interaction Modeling (Brain x Moderator)
+
+An optional moderating variable can be specified via `data_cols.moderator_col` and
+`data_cols.moderator_type` to test whether the association between brain features and
+the outcome varies as a function of a subject-level characteristic (e.g., treatment
+group, age, symptom severity).
+
+### Moderator types
+
+| Type | Coding | Columns produced |
+|------|--------|------------------|
+| `continuous` | Mean-centered on training-split mean (fold-local) | 1 column |
+| `nominal` | Deviation (effect) coding relative to the last sorted level (fold-local frequencies) | K-1 columns (K = number of levels) |
+
+### How interactions are constructed
+
+Interactions are constructed **post-dimensionality-reduction** (after the reducer
+transforms brain features into components or passes them through for `none`). For each
+fold or resampled iteration, the pipeline:
+1. Codes the moderator fold-locally via `_code_moderator`.
+2. Constructs element-wise products of each brain feature column with each moderator
+   column via `_construct_interactions`.
+3. Prepends the moderator main effect columns to the feature matrix.
+4. Appends the interaction columns after the brain features.
+
+The resulting feature matrix layout is:
+`[covariates | moderator main effect(s) | brain features | brain x moderator interactions]`
+
+### Moderator main effect protection
+
+The moderator main effect columns are protected from regularization via
+`ModeratorScaler`, which applies a fixed 1000x amplification (equivalent to
+`penalty_weight = 0.001`). This ensures the elastic net's penalty effectively ignores
+the moderator main effect, analogous to `CovariateScaler` for covariates but with a
+fixed (non-tuned) scale factor. The main effect is retained to satisfy the heredity
+principle (Bien, Taylor, and Tibshirani, 2013): interaction terms should only enter the
+model when the corresponding main effects are present.
+
+### Inference for interactions
+
+Interaction coefficients are included in all downstream inference stages:
+- **Tier 1** (fold-level t-test): per-feature t-test applied to both main and interaction
+  coefficients. For K>2 nominal moderators, Hotelling's T-squared provides an omnibus
+  test across the K-1 contrast coefficients per brain feature.
+- **Tier 2** (bootstrap CIs): Partial Ridge refit preserves both main and interaction
+  coefficients. For classification, the logistic adaptation uses sqrt(n) column scaling
+  (see Known Limitations).
+- **Selection frequency** and **bootstrap importance**: both stages construct interactions
+  per-iteration using full-sample levels (`levels_override`) for nominal moderators,
+  ensuring consistent coding dimensions across resampled iterations.
+
+### Known limitation
+
+Multi-task/multi-class interaction Tier 1, Tier 2, and selection frequency reporting is
+not yet implemented. The pipeline currently produces correct coefficients for these
+configurations but does not produce interaction-specific output files.
+
+---
+
 ## Feature Reduction Methods
 
 All reduction is applied fold-locally inside the CV loop to prevent data leakage.
@@ -216,6 +275,11 @@ fold-specific hyperparameters (fixed from each fold's inner-CV tuning), and back
 coefficients to the original feature space for aggregation. Tuning variance from the nested
 CV is therefore propagated into the bootstrap CIs. This ensures meaningful CI and pd
 computation across iterations with different reduced spaces.
+
+For classification, the Partial Ridge method adapts Liu et al. (2020) from
+linear to logistic regression via differential L2 penalization (selected
+features scaled by sqrt(n), C=1). This is a project-specific extension; see
+Known Limitations.
 
 - **`is_significant`**: primary criterion — CI does not cross zero
 - **`is_significant_fdr`**: survives Benjamini-Hochberg FDR correction at q = 0.05
@@ -299,4 +363,22 @@ parameter types, ranges, constraints, output schemas, and known edge cases.
 - Selection frequency magnitudes may be elevated because hyperparameters are fixed from
   full-N tuning while each subsample uses N/2. Relative ordering is
   preserved; no significance threshold is applied (purely descriptive).
+- Tier 1 fold-ensemble p-values (report_fold_ensemble_importance.csv) treat K
+  fold-level coefficient estimates as independent observations in a one-sample
+  t-test. Because adjacent folds share overlapping training data, the naive
+  variance estimator is downward biased (Bengio and Grandvalet, 2004),
+  producing anti-conservative p-values whose Type I error exceeds the nominal
+  alpha by an algorithm-dependent amount. Tier 1 is designed as a liberal
+  sensitivity screen; Tier 2 bootstrap CIs (report_fold_bootstrap_ci.csv)
+  provide the confirmatory inference and are not affected by this bias.
+- For classification, the Partial Ridge bootstrap CI method (Liu et al., 2020)
+  is adapted from its original linear-model formulation to logistic regression
+  via column scaling (selected features scaled by sqrt(n) with fixed L2
+  penalty C=1). This adaptation is not prescribed by Liu et al. (2020) and
+  should be considered a project-specific extension. Percentile bootstrap CI
+  coverage for this configuration (fold-wise-pooled, Partial-Ridge-refitted,
+  elastic net) has not been directly benchmarked in the literature; however,
+  percentile CIs in regularized settings tend toward conservative overcoverage
+  (wider intervals), which is favorable for the pipeline's zero-crossing
+  thresholding use case.
 - LOO cross-validation disables `n_inner_repeats` (repeated CV is undefined for LOO).

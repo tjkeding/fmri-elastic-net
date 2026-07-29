@@ -63,6 +63,16 @@ data_cols:
                            #   For MultiTaskElasticNet: applied via sqrt(w) pre-transformation of X
                            #   and Y (algebraically equivalent to weighted loss; alpha re-tuned).
 
+  moderator_col: null      # Optional: column name for a moderating variable (brain x moderator
+                           #   interactions). When non-null, moderator_type is required.
+                           #   The moderator's main effect is protected from regularization
+                           #   (fixed penalty_weight=0.001, separate from covariate protection).
+                           #   Interactions are constructed post-dimensionality-reduction.
+  moderator_type: null     # Required when moderator_col is non-null.
+                           #   "continuous": mean-centered (fold-local training-split mean).
+                           #   "nominal": deviation-coded (fold-local training-split frequencies).
+                           #   Coding scheme is hard-coded; no user choice.
+
 # Clustering Parameters (Hierarchical, Density-Based Spatial Clustering of Applications with Noise [HDBSCAN])
 clustering_params:
   # The minimum number of features required to form a cluster.
@@ -176,6 +186,12 @@ stats_params:
   # Block permutation null scores saved as block_perm_null_{label}.csv per block.
   # Set to false if storage is constrained (e.g., high-dimensional data with many bootstraps).
   save_distributions: true
+
+  bootstrap_ci_method: "partial_ridge"  # Bootstrap CI construction method for Tier 2 inference.
+                                        #   "partial_ridge": split estimator (Liu et al. 2020).
+                                        #     Eliminates zero-inflation. Default and recommended.
+                                        #   "percentile": standard percentile CIs (no correction).
+                                        #     WARNING emitted if used with analysis_mode="predict".
 
 # Block Permutation Tests
 # Define one or more "blocks" of features to test for unique contributions (R2-change or AUC-change).
