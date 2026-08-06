@@ -235,6 +235,16 @@ Interaction coefficients are included in all downstream inference stages:
   per-iteration using full-sample levels (`levels_override`) for nominal moderators,
   ensuring consistent coding dimensions across resampled iterations.
 
+### Interaction visualization
+
+Main-effect and interaction-effect visualization data are written to separate CSVs
+(`report_{level}_plotting.csv` and `report_{level}_interaction_plotting.csv`,
+respectively). Interaction visualization includes a `moderator_value` column recording
+each subject's moderator value for downstream plotting. Interaction visualization is
+skipped for K>2 nominal moderators (partial-dependence decomposition is not well-defined
+for multi-contrast interactions) and for `apriori` reduction (cluster-level interaction
+visualization is not produced).
+
 ### Known limitation
 
 Multi-task/multi-class interaction Tier 1, Tier 2, and selection frequency reporting is
@@ -326,7 +336,9 @@ All output files are written to `paths.output_dir`:
 | `cluster_loadings_fold_{n}.csv` | Per-fold PCA loadings for transparency |
 | `ica_mixing_matrix.csv` | ICA mixing matrix A (P × K), activation pattern basis |
 | `ica_mixing_matrix_fold_{n}.csv` | Per-fold ICA mixing matrix for transparency |
-| `report_{level}_plotting.csv` | Subject-level feature vs. outcome data for visualization |
+| `report_interaction_importance.csv` | Bootstrap CIs, pd, FDR flags per interaction term (when moderator is configured) |
+| `report_{level}_plotting.csv` | Subject-level feature vs. outcome data for visualization (main effects) |
+| `report_{level}_interaction_plotting.csv` | Subject-level interaction partial associations with `moderator_value` column (when moderator is configured; K>2 nominal excluded) |
 | `bootstrap_coef_distribution.npz` | Full bootstrap coefficient array (when `save_distributions: true`) |
 | `block_perm_null_{label}.csv` | Block-specific permutation null scores (when `save_distributions: true`) |
 | `pipeline.log` | Full logging output with timing and diagnostics |

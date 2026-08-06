@@ -527,9 +527,10 @@ as part of `main` mode; not skippable.
 - `cluster_pca`: `report_feature_importance.csv`, `cluster_loadings.csv`
 - `apriori`: `report_cluster_importance.csv`, `report_feature_importance.csv`, `cluster_loadings.csv`
 - `ica`: `report_feature_importance.csv`, `ica_mixing_matrix.csv`
-- All methods: `report_{cluster|individual}_plotting.csv` (subject-level visualization data for significant features)
-- When `save_distributions: true`: `bootstrap_coef_distribution.npz`
-- Always: `report_fold_bootstrap_ci.csv` (Tier 2 percentile CIs, pooled across all K folds)
+- All methods: `report_{cluster|individual}_plotting.csv` (subject-level visualization data for significant main-effect features)
+- When moderator configured: `report_interaction_importance.csv` (bootstrap CIs for interaction terms); `report_{cluster|individual}_interaction_plotting.csv` (subject-level interaction partial associations with `moderator_value` column; K>2 nominal excluded; apriori interaction visualization excluded)
+- When `save_distributions: true`: `bootstrap_coef_distribution.npz` (includes `coef_dist_interaction` and `moderator_contrasts` arrays when moderator configured)
+- Always: `report_fold_bootstrap_ci.csv` (Tier 2 percentile CIs, pooled across all K folds; separate main/interaction/per-contrast files when moderator configured)
 
 ### Step 9: Block Permutation (`run_block_perms`)
 
@@ -623,6 +624,11 @@ Produced only when `save_distributions: true`. Compressed NumPy archive with:
   B = bootstrap iterations, K = tasks/classes, P = original brain features.
 - `feature_names`: string array of original brain feature names, length P.
 - `task_labels`: string array of task/class labels (multi-output only).
+- `coef_dist_interaction`: (only when moderator configured) shape `(B, P)` for
+  single-output with continuous or K=2 nominal moderator; `(B, n_mod_cols, P)` for K>2
+  nominal; `(B, K_tasks, P)` or `(B, K_tasks, n_mod_cols, P)` for multi-output.
+- `moderator_contrasts`: (only when moderator configured with K>2 nominal) string array
+  of contrast labels (`contrast_1`, `contrast_2`, ..., `contrast_{K-1}`).
 
 ### `block_perm_null_{label}.csv`
 Produced once per block when `save_distributions: true`. Single column `null_score`
@@ -639,11 +645,30 @@ containing the permutation null distribution for that block.
 DataFrame with rows = original brain features (index), columns = IC labels
 (`IC_1`, `IC_2`, ..., `IC_K`). Values are unnormalized mixing matrix entries.
 
+### `report_interaction_importance.csv`
+Produced only when a moderator is configured. Same schema as `report_feature_importance.csv`
+but reports bootstrap CIs for interaction terms. For K>2 nominal moderators, the `std_coef_mean`
+column reports the L2 norm across K-1 contrast coefficients (collapsing the multivariate
+interaction effect to a scalar magnitude). For continuous or K=2 nominal moderators, the
+coefficient is reported directly.
+
 ### `report_{cluster|individual}_plotting.csv`
-Subject-level partial association data for significant features. Contains subject IDs,
-partial residuals of the feature (after regressing out all other features), and outcome.
-Only written if at least one significant feature exists. Produced by
-`calculate_visualization_data`.
+Subject-level partial association data for significant main-effect features. Contains
+subject IDs, partial residuals of the feature (after regressing out all other features),
+and outcome. Only written if at least one significant feature exists. Produced by
+`calculate_visualization_data` with `effect_type='main'` (or `None` when no moderator).
+
+### `report_{cluster|individual}_interaction_plotting.csv`
+Subject-level partial association data for significant interaction terms. Same schema as
+the main-effect plotting CSV, with the addition of a `moderator_value` column recording
+each subject's raw moderator value for downstream visualization (e.g., scatterplot
+colored by moderator group). Interaction partialling computes: `f_weight * f_scaled *
+M_coded` where `f_weight` is the interaction coefficient, `f_scaled` is the standardized
+brain feature value, and `M_coded` is the coded moderator value. Not produced for K>2
+nominal moderators (partial-dependence decomposition is not well-defined for
+multi-contrast interactions) or for `apriori` reduction (cluster-level interaction
+visualization is excluded by design). Produced by `calculate_visualization_data` with
+`effect_type='interaction'`.
 
 ### `report_fold_ensemble_importance.csv`
 Tier 1 inference output from `_write_tier1_report`. One-sample t-test across K fold-specific
@@ -710,6 +735,14 @@ written as part of Step 8 (Bootstrap Importance) when any bootstrap iterations s
 For multi-task regression or multi-class classification, written to `output_dir/task_{label}/`
 per task/class.
 
+When a moderator is configured, additional Tier 2 files are produced:
+- `report_fold_bootstrap_ci_interaction_moderator.csv`: interaction CIs for continuous
+  or K=2 nominal moderators (same schema as above).
+- `report_fold_bootstrap_ci_interaction_L2_norm.csv`: L2-norm CIs for K>2 nominal
+  moderators (collapses K-1 contrasts to a scalar magnitude per feature).
+- `report_fold_bootstrap_ci_interaction_contrast_{j}.csv`: per-contrast CIs for K>2
+  nominal moderators (one file per contrast, j = 1 to K-1).
+
 ---
 
 ## 7. Multi-Output Behavior
@@ -760,7 +793,43 @@ sh run_fmri-elastic-net.sh <CONFIG_PATH> <LOG_DIR> <MEM_GB> <CPUS_PER_TASK> <N_J
 
 ---
 
-## 10. Edge Cases and Known Limitations
+## 10. Public Utility Functions
+
+### `predict_ensemble(fold_models, X_brain_new, X_cov_new, config, active_covs, moderator=None)`
+
+Predict on new data by averaging predictions across all K fold submodels. Not called
+from `main()`; exposed for downstream use after pipeline execution (e.g., prediction on
+held-out cohorts).
+
+**Parameters:**
+- `fold_models`: list of dicts from `run_nested_cv`.
+- `X_brain_new`: DataFrame of new brain features, shape `(N_new, P)`.
+- `X_cov_new`: DataFrame of new covariate features, or `None`.
+- `config`: pipeline configuration dict.
+- `active_covs`: list of active covariate column names.
+- `moderator`: dict with keys `series` (pd.Series, length `N_new`), `type` (str), `K` (int). Required when the fold models were trained with a moderator; raises `ValueError` on mismatch.
+
+**Returns:** `(y_pred_mean, y_pred_std)`, where `y_pred_mean` is the mean prediction
+across K folds and `y_pred_std` is the standard deviation (uncertainty estimate).
+
+**Feature matrix assembly:** Mirrors the canonical column order from training:
+`[covariates | moderator_main | brain_reduced | interactions]`. The moderator is coded
+once (full-sample indices) outside the per-fold loop; interactions are constructed
+per-fold because each fold's reducer produces a different reduced brain feature space.
+
+### `calculate_visualization_data(..., moderator=None, effect_type=None)`
+
+Computes subject-level partial associations for significant features and writes to CSV.
+When `effect_type='interaction'`, interaction partialling is applied: the linear
+contribution attributed to each interaction term is `f_weight * f_scaled * M_coded`,
+and the output CSV includes a `moderator_value` column. Interaction visualization is
+skipped for K>2 nominal moderators (INFO-level log message) and is not produced for
+`apriori` reduction. Output filename pattern: `report_{level}_plotting.csv` for main
+effects, `report_{level}_interaction_plotting.csv` for interaction effects.
+
+---
+
+## 11. Edge Cases and Known Limitations
 
 | Condition | Behavior |
 |-----------|----------|
@@ -788,4 +857,8 @@ sh run_fmri-elastic-net.sh <CONFIG_PATH> <LOG_DIR> <MEM_GB> <CPUS_PER_TASK> <N_J
 | Multi-output `selected_mask` dimensionality | For multi-task/multi-class, `selected_mask` is collapsed to 1D via `np.any` union across outputs (a feature is selected if non-zero in any task/class) |
 | Nominal moderator level missing from resample | Bootstrap and selection frequency paths use `levels_override` (full-sample level set) to ensure consistent K-1 coding dimensions across resampled iterations. Unseen levels in a given resample produce all-zero contrast rows |
 | Logistic Partial Ridge back-transformation | Selected-feature coefficients are back-transformed by multiplying by sqrt(n), not dividing. This is a project-specific extension of Liu et al. (2020); see Known Limitations in README |
+| `predict_ensemble` moderator mismatch | `ValueError` raised when fold models were trained with a moderator but none is provided (or vice versa). The moderator dict must contain `series`, `type`, and `K` keys matching the training configuration |
+| Subsample size diagnostic with moderator | When a moderator is configured, the N:P diagnostic uses `P_model = P_reduced + n_mod_cols + P_reduced * n_mod_cols` instead of `P_reduced`, where `n_mod_cols` = K-1 (nominal) or 1 (continuous). This reflects the actual feature count seen by the elastic net |
+| K>2 nominal interaction visualization | Skipped with an INFO-level log message. Partial-dependence decomposition into separate main and interaction CSVs is not well-defined for multi-contrast interactions. Per-contrast Tier 2 CIs are still produced |
+| `apriori` interaction visualization | Not produced by design. Cluster-level interaction visualization (aggregating element-wise products across cluster members) was excluded from the interaction modeling scope |
 | Multi-task/multi-class interaction reporting | Interaction Tier 1, Tier 2, and selection frequency output files are not yet implemented for multi-task regression or multi-class classification. Coefficients are computed correctly but not written to interaction-specific output files |

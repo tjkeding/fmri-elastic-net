@@ -1662,11 +1662,15 @@ def run_nested_cv(config, X_brain, Y, weights, X_cov, active_covs, apriori_map=N
             P_reduced = len(fold_reducer.get_feature_names_out())
         else:
             P_reduced = P_brain
+        P_model = P_reduced
+        if moderator is not None:
+            n_mod_cols = moderator['K'] - 1 if moderator['type'] == 'nominal' else 1
+            P_model = P_reduced + n_mod_cols + P_reduced * n_mod_cols
         half_n = len(tr) // 2
-        if half_n < max(3 * P_reduced, 30):
+        if half_n < max(3 * P_model, 30):
             logging.warning(
                 f"Fold {fold_idx}: 50%% subsample size ({half_n}) is below the recommended "
-                f"minimum (max(3*P_reduced={3*P_reduced}, 30)={max(3*P_reduced, 30)}). "
+                f"minimum (max(3*P_model={3*P_model}, 30)={max(3*P_model, 30)}). "
                 f"Selection frequency and bootstrap CIs may be unreliable for this fold."
             )
 
@@ -2832,20 +2836,22 @@ def _boot_task(X_brain, Y, weights, seed, config, best_params, reducer_template,
         return None
 
 
-def calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_model, report_df, level, X_brain_raw=None):
+def calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_model, report_df, level, X_brain_raw=None,
+                                 moderator=None, effect_type=None):
     """Compute subject-level feature-vs-outcome data for visualization and write to CSV.
 
     For each significant feature/component in report_df, computes the partial
     association between that feature and the outcome after partialling out the
     linear contribution of all other features. Results are written to
-    report_{level}_plotting.csv. No file is written if no significant features exist.
+    report_{level}_plotting.csv (main effects) or
+    report_{level}_interaction_plotting.csv (interaction effects).
 
     Parameters
     ----------
     config : dict
         Pipeline configuration dictionary.
     X_full : pd.DataFrame
-        Full feature matrix (covariates + reduced brain features) used for fitting.
+        Full feature matrix (covariates + moderator + reduced brain + interactions).
     Y : pd.Series
         Outcome variable.
     weights : pd.Series or None
@@ -2862,6 +2868,11 @@ def calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_m
     X_brain_raw : pd.DataFrame or None
         Raw (pre-reduction) brain features. Used to look up original feature values
         for ICA back-projection results where feature names refer to raw columns.
+    moderator : dict or None
+        When provided, dict with 'series' (pd.Series), 'type' (str), 'K' (int).
+    effect_type : str or None
+        None (no moderator), 'main' (main-effect partialling), or 'interaction'
+        (interaction-effect partialling).
     """
     analysis_type = config['analysis_type']
     out_dir = config['paths']['output_dir']
@@ -2872,9 +2883,6 @@ def calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_m
     coeffs = best_model.named_steps['model'].coef_
     intercept = getattr(best_model.named_steps['model'], 'intercept_', 0.0)
     if coeffs.ndim > 1:
-        # For visualization, use the mean across tasks/classes as a summary of the
-        # linear contribution of each feature. Per-task visualization is produced
-        # via per-task calls to _compute_importance_report in run_bootstrap.
         coeffs = coeffs.mean(axis=0)
     X_scaled = pd.DataFrame(best_model.named_steps['scaler'].transform(X_full), columns=X_full.columns, index=X_full.index)
     linear_pred_full = X_scaled.dot(coeffs) + (intercept.mean() if isinstance(intercept, np.ndarray) else intercept)
@@ -2887,6 +2895,28 @@ def calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_m
             f"(shape {Y.shape}); visualization is single-output only."
         )
         return
+    if effect_type == 'interaction' and moderator is not None:
+        mod_coded, _ = _code_moderator(
+            moderator['series'], moderator['type'],
+            np.arange(len(moderator['series']))
+        )
+        if mod_coded.shape[1] > 1:
+            logging.info(
+                "calculate_visualization_data: skipped interaction "
+                "visualization for K>2 nominal moderator "
+                f"({mod_coded.shape[1]+1} levels). Per-contrast "
+                "interaction effects are reported in "
+                "report_fold_bootstrap_ci.csv."
+            )
+            return
+    mod_raw = moderator['series'].values if moderator is not None else None
+    mod_coded_vals = None
+    if effect_type == 'interaction' and moderator is not None:
+        mod_coded, _ = _code_moderator(
+            moderator['series'], moderator['type'],
+            np.arange(len(moderator['series']))
+        )
+        mod_coded_vals = mod_coded.values.flatten()
     plot_data = []
     Y_arr = Y.values if hasattr(Y, 'values') else Y
     subject_ids_arr = subject_ids.values if hasattr(subject_ids, 'values') else subject_ids
@@ -2900,18 +2930,25 @@ def calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_m
             continue
         f_weight = row['std_coef_mean']
         f_val_scaled = (f_val_raw - f_val_raw.mean()) / (f_val_raw.std() + 1e-10)
-        lin_contrib = f_weight * f_val_scaled
+        if effect_type == 'interaction' and mod_coded_vals is not None:
+            lin_contrib = f_weight * f_val_scaled * mod_coded_vals
+        else:
+            lin_contrib = f_weight * f_val_scaled
         cov_score = linear_pred_full - lin_contrib
         y_val = (Y_arr - cov_score.values) if analysis_type == 'regression' else expit(lin_contrib + cov_score.mean())
         for i in range(len(Y_arr)):
-            plot_data.append({
+            record = {
                 'subject_id': subject_ids_arr[i],
                 'outcome_raw': Y_arr[i],
                 'feature_name': f_name,
                 'y_axis_value': y_val[i] if hasattr(y_val, '__getitem__') else y_val.iloc[i]
-            })
+            }
+            if mod_raw is not None:
+                record['moderator_value'] = mod_raw[i]
+            plot_data.append(record)
     if plot_data:
-        pd.DataFrame(plot_data).to_csv(os.path.join(out_dir, f'report_{level}_plotting.csv'), index=False)
+        suffix = 'interaction_plotting' if effect_type == 'interaction' else 'plotting'
+        pd.DataFrame(plot_data).to_csv(os.path.join(out_dir, f'report_{level}_{suffix}.csv'), index=False)
 
 
 def _build_individual_report_df(all_feats, stats, feat_col='feature', effect_type=None, contrast=None):
@@ -3003,7 +3040,8 @@ def _compute_importance_preamble(df_coef, all_feats, feat_std_map, config):
 
 
 def _report_apriori(df_coef, all_feats, stats, config, active_covs,
-                    reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model):
+                    reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model,
+                    moderator=None, interaction_report_df=None):
     """Apriori: feature-level report (report_feature_importance.csv) + network-level aggregation via apriori cluster map.
 
     With per-iteration re-reduction, df_coef is in original brain feature space. Network-level
@@ -3013,11 +3051,10 @@ def _report_apriori(df_coef, all_feats, stats, config, active_covs,
     out_dir = stats['out_dir']
     alpha = stats['alpha']
 
-    # --- Individual feature report (df_coef is in original brain feature space after per-iteration back-projection) ---
     indiv_df = _build_individual_report_df(all_feats, stats)
     indiv_df.to_csv(os.path.join(out_dir, 'report_feature_importance.csv'), index=False)
 
-    # --- Network-level report: aggregate to cluster via apriori map ---
+    eff_type = 'main' if moderator is not None else None
     try:
         if reducer_full is not None and hasattr(reducer_full, 'get_loadings'):
             loadings = pd.DataFrame(reducer_full.get_loadings())
@@ -3027,7 +3064,7 @@ def _report_apriori(df_coef, all_feats, stats, config, active_covs,
                 cluster_feats_in = [f for f in cluster_feats if f in df_coef.columns]
                 if not cluster_feats_in:
                     continue
-                cluster_boot = df_coef[cluster_feats_in].mean(axis=1)  # mean across features
+                cluster_boot = df_coef[cluster_feats_in].mean(axis=1)
                 c_mean = cluster_boot.mean()
                 c_low = cluster_boot.quantile(alpha / 2)
                 c_high = cluster_boot.quantile(1 - alpha / 2)
@@ -3045,14 +3082,21 @@ def _report_apriori(df_coef, all_feats, stats, config, active_covs,
                 net_rep = _add_fdr_columns(net_rep)
                 net_rep.to_csv(os.path.join(out_dir, 'report_cluster_importance.csv'), index=False)
                 calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_model,
-                                             net_rep, 'cluster', X_brain)
+                                             net_rep, 'cluster', X_brain,
+                                             moderator=moderator, effect_type=eff_type)
     except (KeyError, ValueError, IndexError) as exc:
         logging.warning(f"Apriori network-level aggregation failed: {exc}")
         logging.debug("Back-projection traceback:", exc_info=True)
 
+    if interaction_report_df is not None:
+        interaction_report_df.to_csv(
+            os.path.join(out_dir, 'report_interaction_importance.csv'), index=False
+        )
+
 
 def _report_standard(df_coef, all_feats, stats, config, active_covs,
-                     reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model):
+                     reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model,
+                     moderator=None, interaction_report_df=None):
     """Standard importance report for none, cluster_pca, and ica reduction methods.
 
     Writes report_feature_importance.csv for all reduction methods and calls
@@ -3061,12 +3105,11 @@ def _report_standard(df_coef, all_feats, stats, config, active_covs,
     visualization call to match the expected column name.
 
     With per-iteration re-reduction, df_coef is already in original brain feature space
-    after back-projection in each bootstrap iteration — report directly.
+    after back-projection in each bootstrap iteration, so report directly.
     """
     out_dir = stats['out_dir']
     red_method = config['feature_reduction_method']
 
-    # Save ICA full-data mixing matrix for transparency
     if red_method == 'ica' and reducer_full is not None and hasattr(reducer_full, 'mixing_unnorm_'):
         mixing_df = pd.DataFrame(
             reducer_full.mixing_unnorm_,
@@ -3078,16 +3121,31 @@ def _report_standard(df_coef, all_feats, stats, config, active_covs,
     indiv_df = _build_individual_report_df(all_feats, stats)
     indiv_df.to_csv(os.path.join(out_dir, 'report_feature_importance.csv'), index=False)
 
+    eff_type = 'main' if moderator is not None else None
     if red_method == 'none':
         calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_model,
-                                     indiv_df, 'individual', None)
+                                     indiv_df, 'individual', None,
+                                     moderator=moderator, effect_type=eff_type)
     else:
         vis_df = indiv_df.rename(columns={'feature': 'cluster_id'}) if red_method == 'cluster_pca' else indiv_df
         calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_model,
-                                     vis_df, 'individual', X_brain)
+                                     vis_df, 'individual', X_brain,
+                                     moderator=moderator, effect_type=eff_type)
+
+    if interaction_report_df is not None:
+        interaction_report_df.to_csv(
+            os.path.join(out_dir, 'report_interaction_importance.csv'), index=False
+        )
+        calculate_visualization_data(
+            config, X_full, Y, weights, subject_ids, best_model,
+            interaction_report_df, 'individual',
+            X_brain if red_method != 'none' else None,
+            moderator=moderator, effect_type='interaction'
+        )
 
 
-def _compute_importance_report(df_coef, all_feats, feat_std_map, config, active_covs, reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model):
+def _compute_importance_report(df_coef, all_feats, feat_std_map, config, active_covs, reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model,
+                               moderator=None, interaction_report_df=None):
     """
     Dispatcher: compute shared statistics, then delegate to reduction-specific branch.
     Applies BH-FDR correction at q=0.05.
@@ -3097,23 +3155,33 @@ def _compute_importance_report(df_coef, all_feats, feat_std_map, config, active_
     branch_args = (df_coef, all_feats, stats, config, active_covs,
                    reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model)
     if red_method == 'apriori':
-        _report_apriori(*branch_args)
+        _report_apriori(*branch_args, moderator=moderator,
+                        interaction_report_df=interaction_report_df)
     else:
-        _report_standard(*branch_args)
+        _report_standard(*branch_args, moderator=moderator,
+                         interaction_report_df=interaction_report_df)
 
 
-def _reconstruct_x_full(fold_models, X_brain, X_cov, config, active_covs):
+def _reconstruct_x_full(fold_models, X_brain, X_cov, config, active_covs, moderator=None):
     """Reconstruct a representative full-data feature matrix for visualization.
 
     Uses the fold-0 model's reducer (if any) to transform the full X_brain, then
-    prepends covariates. This is a descriptive approximation — the fold-0 reducer
-    was fit on the fold-0 training set only, not the full dataset. It is used only
-    for calculate_visualization_data (descriptive pathway).
+    assembles the canonical column layout [covariates, moderator_main, brain_reduced,
+    interactions]. This is a descriptive approximation — the fold-0 reducer was fit
+    on the fold-0 training set only, not the full dataset. When moderator is provided,
+    full-sample indices are used for coding (consistent with the approximation).
+
+    Parameters
+    ----------
+    moderator : dict or None
+        If provided, a dict with keys 'series' (pd.Series of moderator values) and
+        'type' (str, one of 'continuous', 'nominal'). When not None, moderator
+        main-effect columns and brain-by-moderator interaction columns are added.
 
     Returns
     -------
     X_full_repr : pd.DataFrame
-        Representative assembled feature matrix (covariates + reduced brain).
+        Representative assembled feature matrix in canonical column order.
     fm0 : dict
         fold_models[0] record, for access to representative pipeline and feat_std_map.
     """
@@ -3126,12 +3194,27 @@ def _reconstruct_x_full(fold_models, X_brain, X_cov, config, active_covs):
     else:
         X_brain_red = X_brain
 
-    if not X_cov.empty and not is_pre:
-        X_full_repr = pd.concat(
-            [X_cov.reset_index(drop=True), X_brain_red.reset_index(drop=True)], axis=1
+    moderator_coded = None
+    interactions = None
+    if moderator is not None:
+        mod_coded, _ = _code_moderator(
+            moderator['series'], moderator['type'],
+            np.arange(len(moderator['series']))
         )
-    else:
-        X_full_repr = X_brain_red.reset_index(drop=True)
+        moderator_coded = mod_coded.reset_index(drop=True)
+        interactions = _construct_interactions(
+            X_brain_red.reset_index(drop=True), moderator_coded
+        )
+
+    parts = []
+    if not X_cov.empty and not is_pre:
+        parts.append(X_cov.reset_index(drop=True))
+    if moderator_coded is not None:
+        parts.append(moderator_coded)
+    parts.append(X_brain_red.reset_index(drop=True))
+    if interactions is not None:
+        parts.append(interactions)
+    X_full_repr = pd.concat(parts, axis=1) if len(parts) > 1 else parts[0]
 
     return X_full_repr, fm0
 
@@ -3299,31 +3382,16 @@ def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, 
 
     # Representative pipeline and X_full for visualization (fold-0 approximation)
     # Documented as a descriptive approximation: fold-0 reducer fit on fold-0 training data.
-    X_full_repr, fm0 = _reconstruct_x_full(fold_models, X_brain, X_cov, config, active_covs)
+    X_full_repr, fm0 = _reconstruct_x_full(fold_models, X_brain, X_cov, config, active_covs, moderator=moderator)
     best_model_repr = fm0['pipeline']
     reducer_full_repr = fm0['reducer']
 
-    # feat_std_map for importance reporting
-    if red_method == 'none':
-        if cov_method == 'incorporate':
-            # _boot_task strips covariate coefficients before returning; report
-            # columns must match the brain-only return shape (n_brain,).
-            brain_std = X_brain.std(ddof=1).replace(0, 1.0)
-            feat_std_map_report = brain_std
-            all_feats_report = original_feature_names
-            df_coef_cols = original_feature_names
-        else:
-            # feat_std_map from fm0 covers the full feature set (no covariates
-            # or pre_regress: covariates already residualized out).
-            feat_std_map_report = fm0['feat_std_map']
-            all_feats_report = list(X_full_repr.columns)
-            df_coef_cols = all_feats_report
-    else:
-        # Back-projected to original brain feature space
-        brain_std = X_brain.std(ddof=1).replace(0, 1.0)
-        feat_std_map_report = brain_std
-        all_feats_report = original_feature_names
-        df_coef_cols = original_feature_names
+    # feat_std_map for importance reporting (brain-only; _boot_task strips
+    # protected columns before returning, so coef_matrix is always brain-space)
+    brain_std = X_brain.std(ddof=1).replace(0, 1.0)
+    feat_std_map_report = brain_std
+    all_feats_report = original_feature_names
+    df_coef_cols = original_feature_names
 
     # Save cluster/ICA descriptive outputs from fold-0 reducer (representative)
     if reducer_full_repr is not None and hasattr(reducer_full_repr, 'get_loadings'):
@@ -3360,9 +3428,32 @@ def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, 
                 **save_kwargs
             )
 
+        interaction_report_df = None
+        if has_moderator:
+            if n_mod_cols <= 1:
+                df_coef_interaction = pd.DataFrame(
+                    coef_matrix_interaction, columns=df_coef_cols
+                )
+            else:
+                l2_norms_int = np.sqrt(np.sum(
+                    coef_matrix_interaction ** 2, axis=1
+                ))
+                df_coef_interaction = pd.DataFrame(
+                    l2_norms_int, columns=df_coef_cols
+                )
+            int_stats = _compute_importance_preamble(
+                df_coef_interaction, all_feats_report,
+                feat_std_map_report, config
+            )
+            interaction_report_df = _build_individual_report_df(
+                all_feats_report, int_stats
+            )
+
         _compute_importance_report(
             df_coef, all_feats_report, feat_std_map_report, config, active_covs,
-            reducer_full_repr, X_brain, X_full_repr, Y, weights, subject_ids, best_model_repr
+            reducer_full_repr, X_brain, X_full_repr, Y, weights, subject_ids, best_model_repr,
+            moderator=moderator,
+            interaction_report_df=interaction_report_df
         )
 
         _write_tier2_single(
@@ -3424,9 +3515,30 @@ def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, 
             config_k = {**config, 'paths': {**config['paths'], 'output_dir': out_dir_k}}
             df_coef_k = pd.DataFrame(coef_array[:, k, :], columns=df_coef_cols)
             Y_k = Y.iloc[:, k] if hasattr(Y, 'iloc') and Y.ndim > 1 else Y
+
+            interaction_report_df_k = None
+            if has_moderator:
+                if n_mod_cols <= 1:
+                    df_coef_int_k = pd.DataFrame(
+                        coef_array_interaction[:, k, :], columns=df_coef_cols
+                    )
+                else:
+                    int_k = coef_array_interaction[:, k, :, :]
+                    l2_k = np.sqrt(np.sum(int_k ** 2, axis=1))
+                    df_coef_int_k = pd.DataFrame(l2_k, columns=df_coef_cols)
+                int_stats_k = _compute_importance_preamble(
+                    df_coef_int_k, all_feats_report,
+                    feat_std_map_report, config_k
+                )
+                interaction_report_df_k = _build_individual_report_df(
+                    all_feats_report, int_stats_k
+                )
+
             _compute_importance_report(
                 df_coef_k, all_feats_report, feat_std_map_report, config_k, active_covs,
-                reducer_full_repr, X_brain, X_full_repr, Y_k, weights, subject_ids, best_model_repr
+                reducer_full_repr, X_brain, X_full_repr, Y_k, weights, subject_ids, best_model_repr,
+                moderator=moderator,
+                interaction_report_df=interaction_report_df_k
             )
             _write_tier2_single(
                 coef_array[:, k, :],
@@ -3465,7 +3577,7 @@ def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, 
 
 # --- Ensemble Prediction Utility ---
 
-def predict_ensemble(fold_models, X_brain_new, X_cov_new, config, active_covs):
+def predict_ensemble(fold_models, X_brain_new, X_cov_new, config, active_covs, moderator=None):
     """Predict on new data by averaging predictions across all K fold submodels.
 
     Each fold's reducer is applied to X_brain_new, the assembled feature matrix is
@@ -3489,6 +3601,10 @@ def predict_ensemble(fold_models, X_brain_new, X_cov_new, config, active_covs):
         Pipeline configuration.
     active_covs : list of str
         Active covariate column names.
+    moderator : dict or None
+        When provided, must contain keys 'series' (pd.Series of moderator values for
+        the new data, length N_new), 'type' (str), and 'K' (int). Required when the
+        fold models were trained with a moderator.
 
     Returns
     -------
@@ -3496,8 +3612,34 @@ def predict_ensemble(fold_models, X_brain_new, X_cov_new, config, active_covs):
         Mean prediction across all K fold submodels.
     y_pred_std : ndarray, shape (N_new,) or (N_new, K_tasks)
         Standard deviation of predictions across submodels (uncertainty estimate).
+
+    Raises
+    ------
+    ValueError
+        If fold models were trained with a moderator but moderator is None, or vice versa.
     """
+    fm0 = fold_models[0]
+    has_mod_in_model = fm0.get('n_moderator_cols', 0) > 0
+    if has_mod_in_model and moderator is None:
+        raise ValueError(
+            "Fold models were trained with a moderator but no moderator was provided "
+            "to predict_ensemble. Pass a moderator dict with keys 'series', 'type', 'K'."
+        )
+    if not has_mod_in_model and moderator is not None:
+        raise ValueError(
+            "Fold models were trained without a moderator but a moderator was provided "
+            "to predict_ensemble."
+        )
+
     is_pre = config['covariate_method'] == 'pre_regress'
+    moderator_coded = None
+    if moderator is not None:
+        mod_coded, _ = _code_moderator(
+            moderator['series'], moderator['type'],
+            np.arange(len(moderator['series']))
+        )
+        moderator_coded = mod_coded.reset_index(drop=True)
+
     preds = []
     for fm in fold_models:
         reducer = fm['reducer']
@@ -3506,13 +3648,18 @@ def predict_ensemble(fold_models, X_brain_new, X_cov_new, config, active_covs):
             X_br_red = reducer.transform(X_brain_new)
         else:
             X_br_red = X_brain_new
+
+        parts = []
         if (X_cov_new is not None and not X_cov_new.empty
                 and not is_pre):
-            X_new = pd.concat(
-                [X_cov_new.reset_index(drop=True), X_br_red.reset_index(drop=True)], axis=1
-            )
-        else:
-            X_new = X_br_red
+            parts.append(X_cov_new.reset_index(drop=True))
+        if moderator_coded is not None:
+            parts.append(moderator_coded)
+        parts.append(X_br_red.reset_index(drop=True))
+        if moderator_coded is not None:
+            interactions = _construct_interactions(X_br_red.reset_index(drop=True), moderator_coded)
+            parts.append(interactions)
+        X_new = pd.concat(parts, axis=1) if len(parts) > 1 else parts[0]
         preds.append(pipe.predict(X_new))
     preds_arr = np.array(preds)  # shape (K, N_new) or (K, N_new, K_tasks)
     y_pred_mean = preds_arr.mean(axis=0)
