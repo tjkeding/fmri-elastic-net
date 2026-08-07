@@ -125,9 +125,9 @@ from sklearn.exceptions import ConvergenceWarning
 from scipy.stats import pearsonr, ttest_1samp
 from scipy.stats import t as t_dist
 
-# Suppress ConvergenceWarning globally only for perm workers where it is expected;
-# elsewhere we count and log occurrences (see run_bootstrap).
-# UserWarning suppression removed — address specific warnings as they arise.
+# Known-harmless warnings (ConvergenceWarning, Firth overflow/ill-conditioning)
+# are suppressed in main(). The _boot_task catch_warnings block still captures
+# convergence state for the run_bootstrap logging summary.
 
 
 # --- Helpers ---
@@ -512,7 +512,7 @@ def _partial_ridge_refit(X, Y, selected_mask, config, weights=None,
         if len(s_idx) == 0:
             # Only Ridge unselected
             lr = LogisticRegression(penalty='l2', C=1.0, solver='lbfgs',
-                                    max_iter=5000, multi_class='auto')
+                                    max_iter=5000)
             fit_kw = {'sample_weight': weights} if weights is not None else {}
             lr.fit(x_mat, y_vec, **fit_kw)
             c_row[:] = lr.coef_.ravel()
@@ -522,7 +522,7 @@ def _partial_ridge_refit(X, Y, selected_mask, config, weights=None,
         X_scaled = x_mat.copy()
         X_scaled[:, s_idx] *= sqrt_n
         lr = LogisticRegression(penalty='l2', C=1.0, solver='lbfgs',
-                                max_iter=5000, multi_class='auto')
+                                max_iter=5000)
         fit_kw = {'sample_weight': weights} if weights is not None else {}
         lr.fit(X_scaled, y_vec, **fit_kw)
         coef_scaled = lr.coef_.ravel().copy()
@@ -2799,7 +2799,9 @@ def _boot_task(X_brain, Y, weights, seed, config, best_params, reducer_template,
         if bootstrap_ci_method == 'partial_ridge':
             c_raw = _squeeze_binary_coef(pipeline_boot.named_steps['model'].coef_)
             selected_mask = np.any(np.abs(c_raw) > 1e-10, axis=0) if c_raw.ndim == 2 else np.abs(c_raw) > 1e-10
-            X_boot_transformed = pipeline_boot[:-1].transform(X_boot)
+            X_boot_transformed = X_boot
+            for _, step in pipeline_boot.steps[:-1]:
+                X_boot_transformed = step.transform(X_boot_transformed)
             X_boot_arr = X_boot_transformed.values if hasattr(X_boot_transformed, 'values') else np.asarray(X_boot_transformed)
             w_boot_arr = weights.values[idx] if (weights is not None and not is_mt) else None
             Y_for_pr = Y_fit if is_mt else Y_boot
@@ -3768,6 +3770,14 @@ def main():
     out_dir = config['paths']['output_dir']
     os.makedirs(out_dir, exist_ok=True)
     setup_logging(out_dir, args.job_id if args.mode == 'perm_worker' else None)
+
+    # Suppress known-harmless warnings that clutter stderr during normal operation.
+    # The _boot_task catch_warnings(record=True) block still captures convergence
+    # state: its inner simplefilter("always") overrides this filter within that scope.
+    warnings.filterwarnings('ignore', category=ConvergenceWarning)
+    warnings.filterwarnings('ignore', message='overflow encountered in exp',
+                            category=RuntimeWarning)
+    warnings.filterwarnings('ignore', message='Ill-conditioned matrix')
 
     # Validate required config parameters
     if 'n_random_search_iter' not in config.get('cv_params', {}):

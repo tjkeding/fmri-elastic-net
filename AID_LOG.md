@@ -15,7 +15,7 @@ AI assistance was utilized for **analysis pipeline development**, encompassing:
 - Code architecture and design decisions for an elastic net predictive modeling pipeline supporting regression (single-task and multi-task) and classification (binary and multi-class)
 - Statistical methodology review and validation, including nested cross-validation, bootstrap confidence interval construction, Partial Ridge refitting, Firth-penalized logistic regression, and interaction modeling
 - Implementation of pipeline modules (dimensionality reduction, covariate handling, sample weighting, moderator interaction modeling, two-tier inference)
-- Test suite development and validation (808+ unit and integration tests)
+- Test suite development and validation (811+ unit and integration tests)
 - Documentation authoring and refinement (README, INPUT_SPECIFICATION, code docstrings)
 
 AI was **not** used for:
@@ -90,6 +90,8 @@ The project-level configuration file used to guide AI interactions is preserved 
 Raw session transcripts are excluded for privacy reasons. The structured reports above capture all substantive technical decisions, rationale, and implementation details.
 
 ## 7. Version History
+
+- **2026-08-07**: Forward-compatibility fixes and warning suppression. Replaced sklearn Pipeline slicing (`pipeline[:-1].transform()`) with manual step iteration to eliminate FutureWarning (slated to become an error in sklearn 1.8). Removed deprecated `multi_class='auto'` parameter from `_refit_binary` LogisticRegression calls (deprecated in sklearn 1.5, removal in 1.8). Added centralized warning filter in `main()` suppressing known-harmless ConvergenceWarning, overflow-in-exp, and ill-conditioned-matrix warnings from stderr output (programmatic convergence-state capture in `_boot_task` is unaffected). Test suite expansion (808 to 811 tests) with regression guards for all three changes. Reports synced: 1 brainstorm, 2 implement (plan + build), 1 test, 1 document.
 
 - **2026-08-06**: Moderator integration bug fixes (4 findings): `_reconstruct_x_full` and `predict_ensemble` missing moderator and interaction columns, `calculate_visualization_data` partial-dependence decomposition redesigned to separate main and interaction effects into distinct CSVs, subsample size diagnostic updated to use full model dimensionality (P_model) when interactions are present. Test suite expansion (753 to 808 tests) with comprehensive moderator option matrix coverage. Reports synced: 1 brainstorm, 1 implement (plan + build), 2 test, 1 document.
 
