@@ -72,6 +72,13 @@ data_cols:
                            #   "continuous": mean-centered (fold-local training-split mean).
                            #   "nominal": deviation-coded (fold-local training-split frequencies).
                            #   Coding scheme is hard-coded; no user choice.
+  reference_class: null   # Required when analysis_type is "classification" AND the outcome
+                          #   has more than 2 classes (multi-class). Specifies the reference
+                          #   class for fully standardized coefficient computation.
+                          #   Coefficients are reported as class-vs-reference contrasts.
+                          #   Pipeline halts with a diagnostic message if absent for
+                          #   multi-class classification. Ignored for regression and
+                          #   binary classification.
 
 # Clustering Parameters (Hierarchical, Density-Based Spatial Clustering of Applications with Noise [HDBSCAN])
 clustering_params:

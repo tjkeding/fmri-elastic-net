@@ -57,10 +57,12 @@ STATISTICAL NOTES:
   hyperparameter configurations (fold-specific best_params). Percentile CIs from this
   mixture may have sub-nominal coverage; they are best interpreted as sensitivity
   diagnostics (Efron & Tibshirani, 1993, Ch. 13).
-- raw_coef_mean with reduction methods (cluster_pca, apriori, ica) is approximate: the
-  back-projected standardized coefficient is divided by original-feature SD, which is not
-  equivalent to a standardized beta from direct regression on original features. The
-  std_coef_mean and pd columns are the primary inferential quantities.
+- raw_coef and std_coef are independently derived from the internal
+  (X-standardized) coefficient: raw_coef = internal / SD(X),
+  std_coef = internal / SD(Y/Y*). With reduction methods (cluster_pca, apriori, ica),
+  the back-projected coefficient divided by original-feature SD is approximate (not
+  equivalent to a standardized beta from direct regression on original features).
+  The std_coef_mean and pd columns are the primary inferential quantities.
 - ICA feature back-projection uses the activation pattern (A @ beta_IC, Haufe et al.,
   2014, NeuroImage) rather than the filter pattern (pinv(A) @ beta_IC). Activation
   patterns represent signal co-variation in feature space and are more interpretable and
@@ -81,6 +83,16 @@ STATISTICAL NOTES:
   (~0.5–5.0) the effect on coefficient estimates is negligible. For extreme weight
   ranges (e.g., 0.01–100.0), consider pre-standardizing features using weighted mean
   and variance before pipeline execution.
+- For classification, SD(Y*) is model-dependent (Menard, 2011): it changes as
+  predictors are added or removed, unlike SD(Y) for regression.
+- SD(Y/Y*) divisors are computed per-fold from held-out predictions and applied
+  at the fold level before pooling (fold-specific standardization prevents
+  information leakage from training-set predictions).
+- Fully standardized coefficients remain unbounded in multiple regression (Friedman
+  and Wall, 2005). The [-1, 1] bound applies only to simple bivariate regression.
+- Multi-class per-contrast latent-variable standardization is a principled extension
+  of the binary-case derivation (Long, 1997; Menard, 2004) but lacks direct published
+  validation for multinomial softmax models.
 
 Written by: Taylor J. Keding, Ph.D.
 """
@@ -187,6 +199,127 @@ def _is_multitask(config, Y):
         and Y.ndim > 1
         and Y.shape[1] > 1
     )
+
+
+def _compute_sd_y_divisor(config, Y, cv_data):
+    """Compute per-fold SD(Y) or SD(Y*) divisors for fully standardized coefficients.
+
+    Parameters
+    ----------
+    config : dict
+        Pipeline configuration.
+    Y : pd.Series or pd.DataFrame
+        Outcome variable(s).
+    cv_data : dict
+        Cross-validated data from run_nested_cv containing 'fold_held_out'.
+
+    Returns
+    -------
+    dict[int, float or ndarray]
+        Maps fold_idx to the SD(Y/Y*) divisor for that fold.
+        - Scalar for single-output regression and binary classification.
+        - Array of length K_tasks for multi-task regression.
+        - Array of length K-1 for multi-class classification (per contrast).
+    """
+    sd_y_divisors = {}
+    is_classification = config['analysis_type'] == 'classification'
+    is_multi = _is_multitask(config, Y)
+    class_labels = config.get('_runtime', {}).get('class_labels', [])
+    is_multiclass = is_classification and len(class_labels) > 2
+
+    for fold in cv_data['fold_held_out']:
+        fold_idx = fold['fold_idx']
+
+        if not is_classification:
+            # Regression
+            y_held = fold['y_true']
+            if is_multi:
+                # Multi-task: y_held shape (n_held, K_tasks)
+                y_held = np.array(y_held)
+                divisor = np.array([
+                    np.std(y_held[:, k], ddof=1) for k in range(y_held.shape[1])
+                ])
+            else:
+                # Single-output
+                divisor = float(np.std(np.array(y_held), ddof=1))
+        elif is_multiclass:
+            # Multi-class classification: SD(Y*) per contrast vs reference
+            y_prob = np.array(fold['y_prob'])  # (n_held, K)
+            ref_class = config['_runtime']['reference_class']
+            ref_idx = class_labels.index(ref_class)
+            sd_contrasts = []
+            for k_idx in range(len(class_labels)):
+                if k_idx == ref_idx:
+                    continue
+                p_k = np.clip(y_prob[:, k_idx], 1e-15, 1 - 1e-15)
+                p_ref = np.clip(y_prob[:, ref_idx], 1e-15, 1 - 1e-15)
+                logits_k = np.log(p_k / p_ref)
+                sd_contrasts.append(float(
+                    np.sqrt(np.var(logits_k, ddof=1) + np.pi**2 / 3)
+                ))
+            divisor = np.array(sd_contrasts)
+        else:
+            # Binary classification: SD(Y*) via latent variable approach (Long 1997; Menard 2004, 2011)
+            y_prob = np.array(fold['y_prob'])  # (n_held, 2)
+            p1 = np.clip(y_prob[:, 1], 1e-15, 1 - 1e-15)
+            logits = np.log(p1 / (1 - p1))
+            divisor = float(
+                np.sqrt(np.var(logits, ddof=1) + np.pi**2 / 3)
+            )
+
+        sd_y_divisors[fold_idx] = divisor
+
+    # Near-zero guard: degenerate divisors set to 1.0 (report internal coefficients)
+    for fold_idx, divisor in sd_y_divisors.items():
+        if np.ndim(divisor) == 0:
+            if float(divisor) < 1e-10:
+                logging.warning(
+                    f"Fold {fold_idx}: SD(Y/Y*) divisor near zero ({divisor:.2e}); "
+                    "setting to 1.0 (reporting internal coefficients for this fold)."
+                )
+                sd_y_divisors[fold_idx] = 1.0
+        else:
+            arr = np.array(divisor)
+            mask = arr < 1e-10
+            if np.any(mask):
+                logging.warning(
+                    f"Fold {fold_idx}: {mask.sum()} SD(Y/Y*) divisor(s) near zero; "
+                    "setting affected element(s) to 1.0."
+                )
+                arr[mask] = 1.0
+                sd_y_divisors[fold_idx] = arr
+
+    return sd_y_divisors
+
+
+def _reference_difference(coef_array, class_labels, reference_class):
+    """Reference-difference multi-class coefficients: beta_k - beta_ref per contrast.
+
+    Parameters
+    ----------
+    coef_array : ndarray
+        Shape (..., K, P) where K is the number of classes and P is the number
+        of features. The K dimension is axis=-2.
+    class_labels : list
+        Sorted class labels of length K.
+    reference_class : str or int or float
+        The reference class label.
+
+    Returns
+    -------
+    contrasts : ndarray
+        Shape (..., K-1, P). Each slice along K-1 is beta_k - beta_ref.
+    contrast_labels : list of str
+        Labels for K-1 contrasts: ['{class_k}_vs_{reference_class}', ...].
+    """
+    ref_idx = class_labels.index(reference_class)
+    K = len(class_labels)
+    non_ref = [i for i in range(K) if i != ref_idx]
+    ref_slice = np.take(coef_array, [ref_idx], axis=-2)
+    non_ref_slices = np.take(coef_array, non_ref, axis=-2)
+    contrasts = non_ref_slices - ref_slice
+    contrast_labels = [f'{class_labels[i]}_vs_{reference_class}' for i in non_ref]
+    return contrasts, contrast_labels
 
 
 def _squeeze_binary_coef(c):
@@ -1627,6 +1760,10 @@ def run_nested_cv(config, X_brain, Y, weights, X_cov, active_covs, apriori_map=N
         - n_covs : int — number of covariate features prepended
         - n_moderator_cols : int — number of moderator columns (0 when moderator is None)
         - n_reduced : int — number of reduced brain features for this fold
+    cv_data : dict
+        Cross-validated predictions and per-fold held-out data.
+        Keys: 'fold_assignments' (ndarray), 'fold_held_out' (list of dict),
+        'cv_probs'/'cv_pred' (ndarray), 'cv_true' (ndarray).
     """
     logging.info("--- Nested CV ---")
     outer = get_outer_cv(config)
@@ -1647,6 +1784,8 @@ def run_nested_cv(config, X_brain, Y, weights, X_cov, active_covs, apriori_map=N
 
     y_preds, y_probs, y_trues = [], [], []
     fold_models = []
+    fold_assignments = np.full(len(Y), -1, dtype=int)
+    fold_held_out = []
 
     # Use a 1-D array for CV splitting: KFold ignores Y values for regression;
     # for multi-task regression use first column; for multi-class use Y directly.
@@ -1768,6 +1907,32 @@ def run_nested_cv(config, X_brain, Y, weights, X_cov, active_covs, apriori_map=N
         y_trues.append(Y_te.values if hasattr(Y_te, 'values') else Y_te)
         if config['analysis_type'] == 'classification':
             y_probs.append(search.predict_proba(X_te))
+
+        fold_assignments[te] = fold_idx
+
+        fold_score_k = None
+        if config['analysis_type'] == 'classification':
+            y_prob_fold = y_probs[-1]
+            if y_prob_fold.shape[1] > 2:
+                fold_score_k = roc_auc_score(Y_te.values if hasattr(Y_te, 'values') else Y_te, y_prob_fold, multi_class='ovr')
+            else:
+                fold_score_k = roc_auc_score(Y_te.values if hasattr(Y_te, 'values') else Y_te, y_prob_fold[:, 1])
+        else:
+            y_pred_fold = y_preds[-1]
+            fold_score_k = r2_score(
+                Y_te.values if hasattr(Y_te, 'values') else Y_te,
+                y_pred_fold,
+                multioutput='uniform_average'
+            )
+
+        fold_held_out.append({
+            'fold_idx': fold_idx,
+            'indices': te,
+            'y_true': Y_te.values if hasattr(Y_te, 'values') else np.asarray(Y_te),
+            'y_pred': y_preds[-1],
+            'y_prob': y_probs[-1] if config['analysis_type'] == 'classification' else None,
+            'score': fold_score_k,
+        })
 
         # Extract fold-specific coefficients and back-project to original brain feature space.
         # For multi-task + weights: search.best_estimator_.weight_transformer.weights_ is None
@@ -1899,7 +2064,18 @@ def run_nested_cv(config, X_brain, Y, weights, X_cov, active_covs, apriori_map=N
     except Exception as exc:
         logging.warning(f"_compute_evaluation_metrics failed (non-fatal): {exc}")
 
-    return score, fold_models
+    cv_data = {
+        'fold_assignments': fold_assignments,
+        'fold_held_out': fold_held_out,
+    }
+    if config['analysis_type'] == 'classification':
+        cv_data['cv_probs'] = Y_prob
+        cv_data['cv_true'] = Y_true
+    else:
+        cv_data['cv_pred'] = Y_pred
+        cv_data['cv_true'] = Y_true
+
+    return score, fold_models, cv_data
 
 
 # --- Step 5: Tier 1 Inference (fold-wise ensemble) ---
@@ -1943,19 +2119,65 @@ def _write_fold_diagnostics(fold_models, out_dir):
     )
 
 
-def _write_tier1_report(coef_matrix, feature_names, out_dir, ci_level, effect_type=None, contrast=None):
+def _write_fold_performance(cv_data, config, out_dir):
+    """Write per-fold and summary performance metrics derived from held-out fold predictions.
+
+    Outputs
+    -------
+    model_performance_per_fold.csv : fold_idx, metric, value, n_held_out
+    model_performance_fold_summary.csv : metric, mean, sd, min, max, n_folds
+    """
+    fold_held_out = cv_data['fold_held_out']
+    rows = []
+    metric_name = 'R2' if config['analysis_type'] == 'regression' else 'AUC_ROC'
+    for fh in fold_held_out:
+        rows.append({
+            'fold_idx': fh['fold_idx'],
+            'metric': metric_name,
+            'value': fh['score'],
+            'n_held_out': len(fh['indices']),
+        })
+    df = pd.DataFrame(rows)
+    df.to_csv(os.path.join(out_dir, 'model_performance_per_fold.csv'), index=False)
+
+    scores = np.array([fh['score'] for fh in fold_held_out])
+    summary = pd.DataFrame([{
+        'metric': metric_name,
+        'mean': float(scores.mean()),
+        'sd': float(scores.std(ddof=1)) if len(scores) > 1 else float('nan'),
+        'min': float(scores.min()),
+        'max': float(scores.max()),
+        'n_folds': len(scores),
+    }])
+    summary.to_csv(
+        os.path.join(out_dir, 'model_performance_fold_summary.csv'), index=False
+    )
+    logging.info(
+        f"Per-fold {metric_name}: mean={scores.mean():.4f}, "
+        f"SD={scores.std(ddof=1):.4f}, range=[{scores.min():.4f}, {scores.max():.4f}]"
+    )
+
+
+def _write_tier1_report(coef_matrix, feature_names, out_dir, ci_level, sd_y_divisors, feat_std_map, fold_model_indices, effect_type=None, contrast=None):
     """Compute and write Tier 1 inference: one-sample t-test across K fold coefficients.
 
     Parameters
     ----------
     coef_matrix : ndarray, shape (K, P)
-        Fold-specific coefficients in original brain feature space.
+        Fold-specific coefficients in pipeline-internal scale (X-standardized).
     feature_names : list of str, length P
         Original brain feature names.
     out_dir : str
         Output directory.
     ci_level : float
         Confidence level (e.g. 0.95).
+    sd_y_divisors : dict
+        Per-fold SD(Y/Y*) divisors keyed by fold index. Used to fully standardize
+        coefficients (divide internal coefficients by SD(Y) per fold).
+    feat_std_map : pd.Series
+        SD(X) per brain feature; used to recover raw (Y-unit-scale) coefficients.
+    fold_model_indices : list of int
+        Fold index for each row of coef_matrix (length K).
     effect_type : str or None
         If not None, an 'effect_type' column is added to the output DataFrame.
         Use 'main' for main-effect rows and 'interaction' for interaction rows.
@@ -1969,38 +2191,47 @@ def _write_tier1_report(coef_matrix, feature_names, out_dir, ci_level, effect_ty
     Outputs
     -------
     report_fold_ensemble_importance.csv
-        fold_mean_coef, fold_sd_coef, fold_cv_coef, t_statistic, p_value_t,
-        ci_low_t, ci_high_t, is_significant, is_significant_fdr
+        fold_mean_raw, fold_mean_std, fold_cv_coef, t_statistic, p_value_t,
+        ci_low_raw_t, ci_high_raw_t, ci_low_std_t, ci_high_std_t,
+        is_significant, is_significant_fdr
         [plus effect_type, contrast when effect_type is not None]
     """
     KR, P = coef_matrix.shape
-    fold_mean = coef_matrix.mean(axis=0)
-    fold_sd = coef_matrix.std(axis=0, ddof=1)
-    # Coefficient of variation (unsigned): |SD / mean|; guard against division by zero
-    fold_cv = np.where(np.abs(fold_mean) > 1e-30, np.abs(fold_sd / fold_mean), np.nan)
-
+    feat_std_arr = feat_std_map.reindex(feature_names).fillna(1.0).values
+    sd_y_per_fold = np.array([sd_y_divisors[fi] for fi in fold_model_indices])
+    if sd_y_per_fold.ndim == 1:
+        coef_std = coef_matrix / sd_y_per_fold[:, np.newaxis]
+    else:
+        coef_std = coef_matrix / sd_y_per_fold[:, np.newaxis]
+    coef_raw = coef_matrix / feat_std_arr[np.newaxis, :]
+    fold_mean_std = coef_std.mean(axis=0)
+    fold_sd_std = coef_std.std(axis=0, ddof=1)
+    fold_cv = np.where(np.abs(fold_mean_std) > 1e-30, np.abs(fold_sd_std / fold_mean_std), np.nan)
     t_stat, p_val = ttest_1samp(coef_matrix, popmean=0, axis=0)
-
-    # t-based CI (two-sided)
     alpha_t = 1.0 - ci_level
     dof = KR - 1
-    se = fold_sd / np.sqrt(KR)
     t_crit = t_dist.ppf(1.0 - alpha_t / 2, dof)
-    ci_low = fold_mean - t_crit * se
-    ci_high = fold_mean + t_crit * se
-
-    is_sig = (ci_low > 0) | (ci_high < 0)
+    se_std = fold_sd_std / np.sqrt(KR)
+    ci_low_std = fold_mean_std - t_crit * se_std
+    ci_high_std = fold_mean_std + t_crit * se_std
+    fold_mean_raw = coef_raw.mean(axis=0)
+    fold_sd_raw = coef_raw.std(axis=0, ddof=1)
+    se_raw = fold_sd_raw / np.sqrt(KR)
+    ci_low_raw = fold_mean_raw - t_crit * se_raw
+    ci_high_raw = fold_mean_raw + t_crit * se_raw
+    is_sig = (ci_low_std > 0) | (ci_high_std < 0)
     is_sig_fdr = _bh_fdr(p_val, q=0.05)
-
     df_out = pd.DataFrame({
         'feature': feature_names,
-        'fold_mean_coef': fold_mean,
-        'fold_sd_coef': fold_sd,
+        'fold_mean_raw': fold_mean_raw,
+        'fold_mean_std': fold_mean_std,
         'fold_cv_coef': fold_cv,
         't_statistic': t_stat,
         'p_value_t': p_val,
-        'ci_low_t': ci_low,
-        'ci_high_t': ci_high,
+        'ci_low_raw_t': ci_low_raw,
+        'ci_high_raw_t': ci_high_raw,
+        'ci_low_std_t': ci_low_std,
+        'ci_high_std_t': ci_high_std,
         'is_significant': is_sig,
         'is_significant_fdr': is_sig_fdr,
     })
@@ -2014,7 +2245,7 @@ def _write_tier1_report(coef_matrix, feature_names, out_dir, ci_level, effect_ty
         df_out.to_csv(out_path, index=False)
 
 
-def run_tier1_inference(config, fold_models, X_brain, Y, active_covs, moderator=None):
+def run_tier1_inference(config, fold_models, X_brain, Y, active_covs, moderator=None, sd_y_divisors=None):
     """Run Tier 1 inference: one-sample t-test across K fold-specific coefficient vectors.
 
     For each feature, tests H0: mean fold coefficient = 0 using a one-sample t-test
@@ -2039,6 +2270,10 @@ def run_tier1_inference(config, fold_models, X_brain, Y, active_covs, moderator=
     out_dir = config['paths']['output_dir']
     ci_level = config['stats_params']['ci_level']
     original_feature_names = list(X_brain.columns)
+    feat_std_map = X_brain.std(ddof=1).replace(0, 1.0)
+    fold_model_indices = [fm['fold_idx'] for fm in fold_models]
+    if sd_y_divisors is None:
+        sd_y_divisors = {fm['fold_idx']: 1.0 for fm in fold_models}
 
     logging.info(
         "Tier 1 design: liberal screen (anti-conservative by design). "
@@ -2057,6 +2292,7 @@ def run_tier1_inference(config, fold_models, X_brain, Y, active_covs, moderator=
         coef_matrix = np.stack([fm['coef_original'] for fm in fold_models], axis=0)
         _write_tier1_report(
             coef_matrix, original_feature_names, out_dir, ci_level,
+            sd_y_divisors, feat_std_map, fold_model_indices,
             effect_type='main' if moderator is not None else None,
             contrast=None if moderator is None else 'main',
         )
@@ -2073,6 +2309,7 @@ def run_tier1_inference(config, fold_models, X_brain, Y, active_covs, moderator=
                     )
                     _write_tier1_report(
                         coef_matrix_interaction, original_feature_names, out_dir, ci_level,
+                        sd_y_divisors, feat_std_map, fold_model_indices,
                         effect_type='interaction', contrast='moderator',
                     )
                 else:
@@ -2108,17 +2345,32 @@ def run_tier1_inference(config, fold_models, X_brain, Y, active_covs, moderator=
                         contrast_col = coef_array_interaction[:, j, :]  # (K_folds, P)
                         _write_tier1_report(
                             contrast_col, original_feature_names, out_dir, ci_level,
+                            sd_y_divisors, feat_std_map, fold_model_indices,
                             effect_type='interaction', contrast=f'contrast_{j + 1}',
                         )
     else:
         # Multi-output: coef_original is (K_tasks, P); stack to (K, K_tasks, P)
         coef_array = np.stack([fm['coef_original'] for fm in fold_models], axis=0)
         task_labels = _get_task_labels(Y, config)
+
+        # Multi-class reference-differencing: transform (K_folds, K, P) -> (K_folds, K-1, P)
+        is_multiclass = (
+            config['analysis_type'] == 'classification'
+            and config.get('_runtime', {}).get('class_labels') is not None
+            and coef_array.shape[-2] > 2
+        )
+        if is_multiclass:
+            _mc_class_labels = config['_runtime']['class_labels']
+            _mc_ref_class = config['_runtime']['reference_class']
+            coef_array, task_labels = _reference_difference(coef_array, _mc_class_labels, _mc_ref_class)
+
         for k, lbl in enumerate(task_labels):
             out_dir_k = os.path.join(out_dir, f'task_{lbl}')
             os.makedirs(out_dir_k, exist_ok=True)
             coef_matrix_k = coef_array[:, k, :]  # (K, P)
+            sd_y_divisors_k = {fi: (sd_y_divisors[fi][k] if isinstance(sd_y_divisors[fi], np.ndarray) else sd_y_divisors[fi]) for fi in sd_y_divisors}
             _write_tier1_report(coef_matrix_k, original_feature_names, out_dir_k, ci_level,
+                                sd_y_divisors_k, feat_std_map, fold_model_indices,
                                 effect_type='main' if moderator is not None else None,
                                 contrast='main' if moderator is not None else None)
 
@@ -2131,12 +2383,27 @@ def run_tier1_inference(config, fold_models, X_brain, Y, active_covs, moderator=
                     [fm['coef_original_interaction'] for fm in fold_models], axis=0
                 )
 
+                # Multi-class reference-differencing for interaction array
+                if is_multiclass:
+                    if coef_array_interaction.ndim == 3:
+                        # Shape (K_folds, K, P): K at axis -2
+                        coef_array_interaction, _ = _reference_difference(
+                            coef_array_interaction, _mc_class_labels, _mc_ref_class
+                        )
+                    else:
+                        # Shape (K_folds, K, n_mod_cols, P): K at axis -3; transpose to apply
+                        _cai_t = coef_array_interaction.transpose(0, 2, 1, 3)  # (K_folds, n_mod_cols, K, P)
+                        _cai_diff, _ = _reference_difference(_cai_t, _mc_class_labels, _mc_ref_class)
+                        coef_array_interaction = _cai_diff.transpose(0, 2, 1, 3)  # (K_folds, K-1, n_mod_cols, P)
+
                 for k, lbl in enumerate(task_labels):
                     out_dir_k = os.path.join(out_dir, f'task_{lbl}')
+                    sd_y_divisors_k = {fi: (sd_y_divisors[fi][k] if isinstance(sd_y_divisors[fi], np.ndarray) else sd_y_divisors[fi]) for fi in sd_y_divisors}
                     if n_mod_cols <= 1:
                         coef_matrix_interaction_k = coef_array_interaction[:, k, :]  # (K_folds, P)
                         _write_tier1_report(
                             coef_matrix_interaction_k, original_feature_names, out_dir_k, ci_level,
+                            sd_y_divisors_k, feat_std_map, fold_model_indices,
                             effect_type='interaction', contrast='moderator',
                         )
                     else:
@@ -2166,6 +2433,7 @@ def run_tier1_inference(config, fold_models, X_brain, Y, active_covs, moderator=
                             contrast_col = coef_slice_k[:, j, :]  # (K_folds, P)
                             _write_tier1_report(
                                 contrast_col, original_feature_names, out_dir_k, ci_level,
+                                sd_y_divisors_k, feat_std_map, fold_model_indices,
                                 effect_type='interaction', contrast=f'contrast_{j + 1}',
                             )
 
@@ -2838,8 +3106,82 @@ def _boot_task(X_brain, Y, weights, seed, config, best_params, reducer_template,
         return None
 
 
-def calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_model, report_df, level, X_brain_raw=None,
-                                 moderator=None, effect_type=None):
+def _compute_oof_visualization_data(fold_models, cv_data, X_brain, X_cov, config, active_covs, moderator=None):
+    """Compute per-subject OOF linear predictions for visualization.
+
+    For each subject, uses the pipeline from the fold where that subject was
+    held out: that fold's reducer, scaler, and model coefficients.
+
+    Returns
+    -------
+    oof_linear_pred : ndarray, shape (N,)
+    oof_mod_main : ndarray, shape (N,) or None
+    X_full_repr : pd.DataFrame (from fold-0 for column names only)
+    """
+    N = len(X_brain)
+    fold_assignments = cv_data['fold_assignments']
+    oof_linear_pred = np.zeros(N)
+    oof_mod_main = np.zeros(N) if moderator is not None else None
+    is_pre = config['covariate_method'] == 'pre_regress'
+
+    for fm in fold_models:
+        k = fm['fold_idx']
+        held_out = np.where(fold_assignments == k)[0]
+        if len(held_out) == 0:
+            continue
+        pipeline_k = fm['pipeline']
+        reducer_k = fm['reducer']
+        X_brain_ho = X_brain.iloc[held_out].reset_index(drop=True)
+        if reducer_k is not None:
+            X_brain_red_ho = reducer_k.transform(X_brain_ho)
+        else:
+            X_brain_red_ho = X_brain_ho
+        if not isinstance(X_brain_red_ho, pd.DataFrame):
+            n_red = fm['n_reduced']
+            red_names = [f'reduced_{i}' for i in range(n_red)] if X_brain_red_ho.shape[1] == n_red else list(range(X_brain_red_ho.shape[1]))
+            X_brain_red_ho = pd.DataFrame(X_brain_red_ho, columns=red_names[:X_brain_red_ho.shape[1]])
+
+        moderator_coded = None
+        interactions = None
+        if moderator is not None:
+            mod_coded_full, _ = _code_moderator(moderator['series'], moderator['type'], np.arange(len(moderator['series'])))
+            moderator_coded = mod_coded_full.iloc[held_out].reset_index(drop=True)
+            interactions = _construct_interactions(X_brain_red_ho.reset_index(drop=True), moderator_coded)
+
+        parts = []
+        if not X_cov.empty and not is_pre:
+            parts.append(X_cov.iloc[held_out].reset_index(drop=True))
+        if moderator_coded is not None:
+            parts.append(moderator_coded)
+        parts.append(X_brain_red_ho.reset_index(drop=True))
+        if interactions is not None:
+            parts.append(interactions)
+        X_full_ho = pd.concat(parts, axis=1) if len(parts) > 1 else parts[0]
+
+        scaler_k = pipeline_k.named_steps['scaler']
+        model_k = pipeline_k.named_steps['model']
+        X_scaled_ho = scaler_k.transform(X_full_ho)
+        coeffs_k = _squeeze_binary_coef(model_k.coef_)
+        if coeffs_k.ndim > 1:
+            coeffs_k = coeffs_k.mean(axis=0)
+        intercept_k = getattr(model_k, 'intercept_', 0.0)
+        if isinstance(intercept_k, np.ndarray):
+            intercept_k = intercept_k.mean()
+        oof_linear_pred[held_out] = X_scaled_ho @ coeffs_k + intercept_k
+
+        if moderator is not None:
+            n_covs_k = fm['n_covs']
+            n_mod_cols_k = fm['n_moderator_cols']
+            mod_indices = list(range(n_covs_k, n_covs_k + n_mod_cols_k))
+            mod_contrib = sum(coeffs_k[idx] * X_scaled_ho[:, idx] for idx in mod_indices)
+            oof_mod_main[held_out] = mod_contrib
+
+    X_full_repr, _ = _reconstruct_x_full(fold_models, X_brain, X_cov, config, active_covs, moderator)
+    return oof_linear_pred, oof_mod_main, X_full_repr
+
+
+def calculate_visualization_data(config, X_full, Y, weights, subject_ids, oof_linear_pred, report_df, level, X_brain_raw=None,
+                                 moderator=None, effect_type=None, main_report_df=None, oof_mod_main=None):
     """Compute subject-level feature-vs-outcome data for visualization and write to CSV.
 
     For each significant feature/component in report_df, computes the partial
@@ -2860,10 +3202,10 @@ def calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_m
         Sample weights (unused in visualization; reserved for API consistency).
     subject_ids : pd.Series
         Subject identifier column.
-    best_model : fitted sklearn Pipeline
-        Full-data pipeline (scaler + cov_scaler + model).
+    oof_linear_pred : ndarray, shape (N,)
+        Per-subject OOF linear predictions from _compute_oof_visualization_data.
     report_df : pd.DataFrame
-        Importance report containing is_significant, std_coef_mean, and a feature
+        Importance report containing is_significant, raw_coef_mean, and a feature
         identifier column (feature, cluster_id, or component_id).
     level : str
         Label for output file naming: 'cluster' or 'individual'.
@@ -2875,6 +3217,12 @@ def calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_m
     effect_type : str or None
         None (no moderator), 'main' (main-effect partialling), or 'interaction'
         (interaction-effect partialling).
+    main_report_df : pd.DataFrame or None
+        Main-effect importance report; used for interaction lin_contrib to look up
+        brain main-effect raw coefficients.
+    oof_mod_main : ndarray, shape (N,) or None
+        Per-subject OOF moderator main-effect contribution; used in interaction
+        lin_contrib.
     """
     analysis_type = config['analysis_type']
     out_dir = config['paths']['output_dir']
@@ -2882,12 +3230,7 @@ def calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_m
     candidates = report_df[mask]
     if candidates.empty:
         return
-    coeffs = best_model.named_steps['model'].coef_
-    intercept = getattr(best_model.named_steps['model'], 'intercept_', 0.0)
-    if coeffs.ndim > 1:
-        coeffs = coeffs.mean(axis=0)
-    X_scaled = pd.DataFrame(best_model.named_steps['scaler'].transform(X_full), columns=X_full.columns, index=X_full.index)
-    linear_pred_full = X_scaled.dot(coeffs) + (intercept.mean() if isinstance(intercept, np.ndarray) else intercept)
+    linear_pred_full = pd.Series(oof_linear_pred, index=X_full.index)
     feat_col = 'component_id' if 'component_id' in report_df.columns else (
         'cluster_id' if 'cluster_id' in report_df.columns else 'feature'
     )
@@ -2930,12 +3273,21 @@ def calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_m
             f_val_raw = X_full[f_name]
         else:
             continue
-        f_weight = row['std_coef_mean']
-        f_val_scaled = (f_val_raw - f_val_raw.mean()) / (f_val_raw.std() + 1e-10)
+        f_raw_coef = row['raw_coef_mean']
+        f_centered = f_val_raw - f_val_raw.mean()
         if effect_type == 'interaction' and mod_coded_vals is not None:
-            lin_contrib = f_weight * f_val_scaled * mod_coded_vals
+            brain_raw_coef = 0.0
+            if main_report_df is not None:
+                feat_col_main = ('component_id' if 'component_id' in main_report_df.columns else ('cluster_id' if 'cluster_id' in main_report_df.columns else 'feature'))
+                match = main_report_df[main_report_df[feat_col_main] == f_name]
+                if not match.empty:
+                    brain_raw_coef = match['raw_coef_mean'].values[0]
+            brain_main = brain_raw_coef * f_centered
+            mod_main = oof_mod_main if oof_mod_main is not None else np.zeros(len(Y_arr))
+            int_contrib = f_raw_coef * f_centered * mod_coded_vals
+            lin_contrib = brain_main + mod_main + int_contrib
         else:
-            lin_contrib = f_weight * f_val_scaled
+            lin_contrib = f_raw_coef * f_centered
         cov_score = linear_pred_full - lin_contrib
         y_val = (Y_arr - cov_score.values) if analysis_type == 'regression' else expit(lin_contrib + cov_score.mean())
         for i in range(len(Y_arr)):
@@ -3005,34 +3357,51 @@ def _add_fdr_columns(df, pd_col='pd'):
 
 
 
-def _compute_importance_preamble(df_coef, all_feats, feat_std_map, config):
+def _compute_importance_preamble(df_coef_internal, df_coef_std, all_feats, feat_std_map, config):
     """
     Compute shared statistics for all reduction methods: std/raw means, CIs, pd, is_significant.
+
+    Accepts two DataFrames: df_coef_internal (pipeline-internal scale, i.e., X-standardized
+    but not Y-standardized) and df_coef_std (fully standardized: divided by SD(Y) per fold).
+    Significance and pd are computed on df_coef_std. Raw coefficients (Y-unit scale) are
+    recovered by dividing df_coef_internal by feat_std_map (SD(X)), applied element-wise.
 
     Notes
     -----
     With per-iteration re-reduction (conditional bootstrap, Efron & Tibshirani, 1993,
-    Ch. 13), df_coef reaching this function is always brain-only: covariate coefficients
-    are stripped upstream in run_nested_cv (coef_original), _boot_task (bootstrap
-    coefficients), and _subsample_iter (selection-frequency indicators). No penalty-weight
-    adjustment is therefore applied here; raw coefficients are recovered by dividing
-    standardised coefficients by the aligned feature standard deviations directly.
+    Ch. 13), df_coef_internal reaching this function is always brain-only: covariate
+    coefficients are stripped upstream in run_nested_cv (coef_original), _boot_task
+    (bootstrap coefficients), and _subsample_iter (selection-frequency indicators).
     """
     out_dir = config['paths']['output_dir']
     alpha = 1.0 - config['stats_params']['ci_level']
-    std_means = df_coef.mean()
-    std_ci_low = df_coef.quantile(alpha / 2)
-    std_ci_high = df_coef.quantile(1 - alpha / 2)
 
-    # Align feat_std_map to df_coef columns (may differ after per-iteration back-projection)
-    feat_std_map_aligned = feat_std_map.reindex(df_coef.columns).fillna(1.0)
+    std_means = df_coef_std.mean()
+    std_ci_low = df_coef_std.quantile(alpha / 2)
+    std_ci_high = df_coef_std.quantile(1 - alpha / 2)
 
-    raw_means = np.divide(std_means, feat_std_map_aligned, out=np.zeros_like(std_means), where=feat_std_map_aligned != 0)
-    raw_ci_low = np.divide(std_ci_low, feat_std_map_aligned, out=np.zeros_like(std_ci_low), where=feat_std_map_aligned != 0)
-    raw_ci_high = np.divide(std_ci_high, feat_std_map_aligned, out=np.zeros_like(std_ci_high), where=feat_std_map_aligned != 0)
+    feat_std_map_aligned = feat_std_map.reindex(df_coef_internal.columns).fillna(1.0)
+    raw_means = np.divide(
+        df_coef_internal.mean().values, feat_std_map_aligned.values,
+        out=np.zeros(len(feat_std_map_aligned), dtype=float),
+        where=feat_std_map_aligned.values != 0
+    )
+    raw_ci_low = np.divide(
+        df_coef_internal.quantile(alpha / 2).values, feat_std_map_aligned.values,
+        out=np.zeros(len(feat_std_map_aligned), dtype=float),
+        where=feat_std_map_aligned.values != 0
+    )
+    raw_ci_high = np.divide(
+        df_coef_internal.quantile(1 - alpha / 2).values, feat_std_map_aligned.values,
+        out=np.zeros(len(feat_std_map_aligned), dtype=float),
+        where=feat_std_map_aligned.values != 0
+    )
+    raw_means = pd.Series(raw_means, index=df_coef_internal.columns)
+    raw_ci_low = pd.Series(raw_ci_low, index=df_coef_internal.columns)
+    raw_ci_high = pd.Series(raw_ci_high, index=df_coef_internal.columns)
 
     is_sig = (std_ci_low > 0) | (std_ci_high < 0)
-    pd_val = pd.concat([(df_coef > 0).mean(), (df_coef < 0).mean()], axis=1).max(axis=1)
+    pd_val = pd.concat([(df_coef_std > 0).mean(), (df_coef_std < 0).mean()], axis=1).max(axis=1)
 
     return dict(
         std_means=std_means, std_ci_low=std_ci_low, std_ci_high=std_ci_high,
@@ -3041,9 +3410,9 @@ def _compute_importance_preamble(df_coef, all_feats, feat_std_map, config):
     )
 
 
-def _report_apriori(df_coef, all_feats, stats, config, active_covs,
-                    reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model,
-                    moderator=None, interaction_report_df=None):
+def _report_apriori(df_coef_internal, df_coef_std, all_feats, stats, config, active_covs,
+                    reducer_full, X_brain, X_full, Y, weights, subject_ids, oof_linear_pred,
+                    moderator=None, interaction_report_df=None, oof_mod_main=None):
     """Apriori: feature-level report (report_feature_importance.csv) + network-level aggregation via apriori cluster map.
 
     With per-iteration re-reduction, df_coef is in original brain feature space. Network-level
@@ -3063,19 +3432,25 @@ def _report_apriori(df_coef, all_feats, stats, config, active_covs,
             cluster_rows = []
             for c_name in loadings['cluster'].unique():
                 cluster_feats = loadings[loadings['cluster'] == c_name]['feature'].tolist()
-                cluster_feats_in = [f for f in cluster_feats if f in df_coef.columns]
+                cluster_feats_in = [f for f in cluster_feats if f in df_coef_std.columns]
                 if not cluster_feats_in:
                     continue
-                cluster_boot = df_coef[cluster_feats_in].mean(axis=1)
-                c_mean = cluster_boot.mean()
-                c_low = cluster_boot.quantile(alpha / 2)
-                c_high = cluster_boot.quantile(1 - alpha / 2)
-                c_pd = max(float((cluster_boot > 0).mean()), float((cluster_boot < 0).mean()))
+                cluster_boot_std = df_coef_std[cluster_feats_in].mean(axis=1)
+                feat_std_map_report = X_brain.std(ddof=1).replace(0, 1.0)
+                df_coef_raw = df_coef_internal.div(feat_std_map_report.reindex(df_coef_internal.columns).fillna(1.0), axis=1)
+                cluster_boot_raw = df_coef_raw[cluster_feats_in].mean(axis=1)
+                c_mean = cluster_boot_std.mean()
+                c_low = cluster_boot_std.quantile(alpha / 2)
+                c_high = cluster_boot_std.quantile(1 - alpha / 2)
+                c_pd = max(float((cluster_boot_std > 0).mean()), float((cluster_boot_std < 0).mean()))
                 cluster_rows.append({
                     'cluster_id': c_name,
                     'std_coef_mean': c_mean,
                     'std_ci_low': c_low,
                     'std_ci_high': c_high,
+                    'raw_coef_mean': float(cluster_boot_raw.mean()),
+                    'raw_ci_low': float(cluster_boot_raw.quantile(alpha / 2)),
+                    'raw_ci_high': float(cluster_boot_raw.quantile(1 - alpha / 2)),
                     'pd': c_pd,
                     'is_significant': bool((c_low > 0) or (c_high < 0))
                 })
@@ -3083,9 +3458,10 @@ def _report_apriori(df_coef, all_feats, stats, config, active_covs,
                 net_rep = pd.DataFrame(cluster_rows)
                 net_rep = _add_fdr_columns(net_rep)
                 net_rep.to_csv(os.path.join(out_dir, 'report_cluster_importance.csv'), index=False)
-                calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_model,
+                calculate_visualization_data(config, X_full, Y, weights, subject_ids, oof_linear_pred,
                                              net_rep, 'cluster', X_brain,
-                                             moderator=moderator, effect_type=eff_type)
+                                             moderator=moderator, effect_type=eff_type,
+                                             oof_mod_main=oof_mod_main)
     except (KeyError, ValueError, IndexError) as exc:
         logging.warning(f"Apriori network-level aggregation failed: {exc}")
         logging.debug("Back-projection traceback:", exc_info=True)
@@ -3096,9 +3472,9 @@ def _report_apriori(df_coef, all_feats, stats, config, active_covs,
         )
 
 
-def _report_standard(df_coef, all_feats, stats, config, active_covs,
-                     reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model,
-                     moderator=None, interaction_report_df=None):
+def _report_standard(df_coef_internal, df_coef_std, all_feats, stats, config, active_covs,
+                     reducer_full, X_brain, X_full, Y, weights, subject_ids, oof_linear_pred,
+                     moderator=None, interaction_report_df=None, oof_mod_main=None):
     """Standard importance report for none, cluster_pca, and ica reduction methods.
 
     Writes report_feature_importance.csv for all reduction methods and calls
@@ -3125,43 +3501,47 @@ def _report_standard(df_coef, all_feats, stats, config, active_covs,
 
     eff_type = 'main' if moderator is not None else None
     if red_method == 'none':
-        calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_model,
+        calculate_visualization_data(config, X_full, Y, weights, subject_ids, oof_linear_pred,
                                      indiv_df, 'individual', None,
-                                     moderator=moderator, effect_type=eff_type)
+                                     moderator=moderator, effect_type=eff_type,
+                                     oof_mod_main=oof_mod_main)
     else:
         vis_df = indiv_df.rename(columns={'feature': 'cluster_id'}) if red_method == 'cluster_pca' else indiv_df
-        calculate_visualization_data(config, X_full, Y, weights, subject_ids, best_model,
+        calculate_visualization_data(config, X_full, Y, weights, subject_ids, oof_linear_pred,
                                      vis_df, 'individual', X_brain,
-                                     moderator=moderator, effect_type=eff_type)
+                                     moderator=moderator, effect_type=eff_type,
+                                     oof_mod_main=oof_mod_main)
 
     if interaction_report_df is not None:
         interaction_report_df.to_csv(
             os.path.join(out_dir, 'report_interaction_importance.csv'), index=False
         )
         calculate_visualization_data(
-            config, X_full, Y, weights, subject_ids, best_model,
+            config, X_full, Y, weights, subject_ids, oof_linear_pred,
             interaction_report_df, 'individual',
             X_brain if red_method != 'none' else None,
-            moderator=moderator, effect_type='interaction'
+            moderator=moderator, effect_type='interaction',
+            main_report_df=indiv_df, oof_mod_main=oof_mod_main
         )
 
 
-def _compute_importance_report(df_coef, all_feats, feat_std_map, config, active_covs, reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model,
-                               moderator=None, interaction_report_df=None):
+def _compute_importance_report(df_coef_internal, df_coef_std, all_feats, feat_std_map, config, active_covs, reducer_full, X_brain, X_full, Y, weights, subject_ids, oof_linear_pred,
+                               moderator=None, interaction_report_df=None, oof_mod_main=None):
     """
     Dispatcher: compute shared statistics, then delegate to reduction-specific branch.
     Applies BH-FDR correction at q=0.05.
+    Accepts dual DataFrames: df_coef_internal (X-standardized) and df_coef_std (fully standardized).
     """
-    stats = _compute_importance_preamble(df_coef, all_feats, feat_std_map, config)
+    stats = _compute_importance_preamble(df_coef_internal, df_coef_std, all_feats, feat_std_map, config)
     red_method = config['feature_reduction_method']
-    branch_args = (df_coef, all_feats, stats, config, active_covs,
-                   reducer_full, X_brain, X_full, Y, weights, subject_ids, best_model)
+    branch_args = (df_coef_internal, df_coef_std, all_feats, stats, config, active_covs,
+                   reducer_full, X_brain, X_full, Y, weights, subject_ids, oof_linear_pred)
     if red_method == 'apriori':
         _report_apriori(*branch_args, moderator=moderator,
-                        interaction_report_df=interaction_report_df)
+                        interaction_report_df=interaction_report_df, oof_mod_main=oof_mod_main)
     else:
         _report_standard(*branch_args, moderator=moderator,
-                         interaction_report_df=interaction_report_df)
+                         interaction_report_df=interaction_report_df, oof_mod_main=oof_mod_main)
 
 
 def _reconstruct_x_full(fold_models, X_brain, X_cov, config, active_covs, moderator=None):
@@ -3221,19 +3601,23 @@ def _reconstruct_x_full(fold_models, X_brain, X_cov, config, active_covs, modera
     return X_full_repr, fm0
 
 
-def _write_tier2_single(coef_pool, feature_names, out_dir, ci_level, effect_type=None, contrast=None):
+def _write_tier2_single(coef_pool_internal, coef_pool_std, feature_names, out_dir, ci_level, feat_std_map, effect_type=None, contrast=None):
     """Compute and write Tier 2 inference: pooled fold-wise bootstrap percentile CIs.
 
     Parameters
     ----------
-    coef_pool : ndarray, shape (B_total, P)
-        Pooled bootstrap coefficients across all K folds.
+    coef_pool_internal : ndarray, shape (B_total, P)
+        Pooled bootstrap coefficients in pipeline-internal scale (X-standardized).
+    coef_pool_std : ndarray, shape (B_total, P)
+        Pooled bootstrap coefficients fully standardized (divided by per-fold SD(Y)).
     feature_names : list of str, length P
         Original brain feature names.
     out_dir : str
         Output directory.
     ci_level : float
         Confidence level (e.g. 0.95).
+    feat_std_map : pd.Series
+        SD(X) per brain feature; used to recover raw (Y-unit-scale) coefficients.
     effect_type : str or None
         When moderator is active, the effect type label ('main' or 'interaction').
         If None, backward-compatible behavior: no column added, single fresh write.
@@ -3244,28 +3628,32 @@ def _write_tier2_single(coef_pool, feature_names, out_dir, ci_level, effect_type
     Outputs
     -------
     report_fold_bootstrap_ci.csv
-        boot_mean_coef, boot_ci_low, boot_ci_high, pd, p_value,
-        is_significant, is_significant_fdr. When moderator is active, also
-        effect_type and contrast columns.
+        boot_mean_raw, boot_mean_std, boot_ci_low_raw, boot_ci_high_raw,
+        boot_ci_low_std, boot_ci_high_std, pd, p_value, is_significant,
+        is_significant_fdr. When moderator is active, also effect_type and contrast.
     """
     alpha_b = 1.0 - ci_level
-    boot_mean = coef_pool.mean(axis=0)
-    boot_ci_low = np.percentile(coef_pool, 100 * alpha_b / 2, axis=0)
-    boot_ci_high = np.percentile(coef_pool, 100 * (1 - alpha_b / 2), axis=0)
-    B = coef_pool.shape[0]
-    pd_val = np.maximum(
-        (coef_pool > 0).sum(axis=0) / B,
-        (coef_pool < 0).sum(axis=0) / B
-    )
+    feat_std_arr = feat_std_map.reindex(feature_names).fillna(1.0).values
+    boot_mean_std = coef_pool_std.mean(axis=0)
+    boot_ci_low_std = np.percentile(coef_pool_std, 100 * alpha_b / 2, axis=0)
+    boot_ci_high_std = np.percentile(coef_pool_std, 100 * (1 - alpha_b / 2), axis=0)
+    coef_pool_raw = coef_pool_internal / feat_std_arr[np.newaxis, :]
+    boot_mean_raw = coef_pool_raw.mean(axis=0)
+    boot_ci_low_raw = np.percentile(coef_pool_raw, 100 * alpha_b / 2, axis=0)
+    boot_ci_high_raw = np.percentile(coef_pool_raw, 100 * (1 - alpha_b / 2), axis=0)
+    B = coef_pool_std.shape[0]
+    pd_val = np.maximum((coef_pool_std > 0).sum(axis=0) / B, (coef_pool_std < 0).sum(axis=0) / B)
     p_value = np.clip(2 * (1 - pd_val), 0.0, 1.0)
-    is_sig = (boot_ci_low > 0) | (boot_ci_high < 0)
+    is_sig = (boot_ci_low_std > 0) | (boot_ci_high_std < 0)
     is_sig_fdr = _bh_fdr(p_value, q=0.05)
-
     df_result = pd.DataFrame({
         'feature': feature_names,
-        'boot_mean_coef': boot_mean,
-        'boot_ci_low': boot_ci_low,
-        'boot_ci_high': boot_ci_high,
+        'boot_mean_raw': boot_mean_raw,
+        'boot_mean_std': boot_mean_std,
+        'boot_ci_low_raw': boot_ci_low_raw,
+        'boot_ci_high_raw': boot_ci_high_raw,
+        'boot_ci_low_std': boot_ci_low_std,
+        'boot_ci_high_std': boot_ci_high_std,
         'pd': pd_val,
         'p_value': p_value,
         'is_significant': is_sig,
@@ -3274,7 +3662,6 @@ def _write_tier2_single(coef_pool, feature_names, out_dir, ci_level, effect_type
     if effect_type is not None:
         df_result['effect_type'] = effect_type
         df_result['contrast'] = contrast
-
     out_path = os.path.join(out_dir, 'report_fold_bootstrap_ci.csv')
     if effect_type is not None and effect_type != 'main':
         df_result.to_csv(out_path, mode='a', header=False, index=False)
@@ -3282,7 +3669,7 @@ def _write_tier2_single(coef_pool, feature_names, out_dir, ci_level, effect_type
         df_result.to_csv(out_path, index=False)
 
 
-def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, fold_models, apriori_map=None, moderator=None):
+def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, fold_models, apriori_map=None, moderator=None, sd_y_divisors=None, *, cv_data):
     """Run fold-wise pooled bootstrap importance estimation (Tier 2 inference).
 
     Bootstrap iterations are distributed evenly across all K folds (each fold gets
@@ -3302,6 +3689,11 @@ def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, 
         When not None and 'type' == 'nominal', full-sample levels are computed once
         and passed to _boot_task as levels_override to ensure consistent coding
         dimensions across bootstrap resamples (see _code_moderator).
+    cv_data : dict
+        Cross-validated fold data (fold_assignments, fold_held_out) from run_nested_cv.
+        Required keyword-only argument (no default): used by _compute_oof_visualization_data
+        for the OOF ensemble visualization and by _compute_sd_y_divisor for per-fold
+        SD(Y/Y*) computation. Every call site must supply it explicitly.
     """
     logging.info("--- Bootstrap Importance (fold-wise, Tier 2) ---")
     n_fold_bootstraps = _get_n_fold_bootstraps(config)
@@ -3346,7 +3738,19 @@ def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, 
         for bp, reducer_tmpl, s in task_list
     )
 
-    valid_res = [r for r in all_res if r is not None]
+    # Reconstruct fold index for each result (task_list is fold-sequential)
+    fold_indices_all = []
+    for fold_idx_track in range(len(fold_models)):
+        fold_indices_all.extend([fold_idx_track] * n_per_fold_repeat)
+    valid_pairs = [(r, fi) for r, fi in zip(all_res, fold_indices_all) if r is not None]
+    valid_res = [pair[0] for pair in valid_pairs]
+    valid_fold_indices = [pair[1] for pair in valid_pairs]
+
+    if sd_y_divisors is not None:
+        sd_y_per_iter = np.array([sd_y_divisors[fi] for fi in valid_fold_indices])
+    else:
+        sd_y_per_iter = np.ones(len(valid_res))
+
     n_failed = len(all_res) - len(valid_res)
     n_total = len(all_res)
     if n_failed > 0:
@@ -3382,11 +3786,11 @@ def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, 
         else:
             logging.info(f"Firth fallback used in {n_firth}/{len(valid_res)} iterations ({firth_pct:.1f}%).")
 
-    # Representative pipeline and X_full for visualization (fold-0 approximation)
-    # Documented as a descriptive approximation: fold-0 reducer fit on fold-0 training data.
-    X_full_repr, fm0 = _reconstruct_x_full(fold_models, X_brain, X_cov, config, active_covs, moderator=moderator)
-    best_model_repr = fm0['pipeline']
-    reducer_full_repr = fm0['reducer']
+    # OOF linear predictions and representative X_full for visualization
+    oof_linear_pred, oof_mod_main, X_full_repr = _compute_oof_visualization_data(
+        fold_models, cv_data, X_brain, X_cov, config, active_covs, moderator=moderator
+    )
+    reducer_full_repr = fold_models[0]['reducer']
 
     # feat_std_map for importance reporting (brain-only; _boot_task strips
     # protected columns before returning, so coef_matrix is always brain-space)
@@ -3407,22 +3811,36 @@ def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, 
 
     if not is_multi:
         coef_matrix = np.stack([r[0] for r in valid_res], axis=0)  # (B, P)
-        df_coef = pd.DataFrame(coef_matrix, columns=df_coef_cols)
+        coef_matrix_internal = coef_matrix
+        if sd_y_per_iter.ndim == 1:
+            coef_matrix_std = coef_matrix_internal / sd_y_per_iter[:, np.newaxis]
+        else:
+            coef_matrix_std = coef_matrix_internal / sd_y_per_iter[:, np.newaxis]
+        df_coef_internal = pd.DataFrame(coef_matrix_internal, columns=df_coef_cols)
+        df_coef_std = pd.DataFrame(coef_matrix_std, columns=df_coef_cols)
 
         has_moderator = moderator is not None and fold_models[0].get('coef_original_interaction') is not None
         coef_matrix_interaction = None
+        coef_matrix_interaction_internal = None
+        coef_matrix_interaction_std = None
         n_mod_cols = 0
         if has_moderator:
             coef_matrix_interaction = np.stack([r[1] for r in valid_res], axis=0)
             n_mod_cols = fold_models[0]['n_moderator_cols']
+            coef_matrix_interaction_internal = coef_matrix_interaction
+            # K>2 nominal moderators produce an extra K-1 contrast axis (shape (B, K-1, P) vs (B, P) for continuous/binary moderators); the SD(Y) divisor broadcast needs an extra newaxis to align with this additional contrast dimension.
+            if coef_matrix_interaction_internal.ndim == 3:
+                coef_matrix_interaction_std = coef_matrix_interaction_internal / sd_y_per_iter[:, np.newaxis, np.newaxis]
+            else:
+                coef_matrix_interaction_std = coef_matrix_interaction_internal / sd_y_per_iter[:, np.newaxis]
 
         if config['stats_params'].get('save_distributions', True):
             save_kwargs = dict(
-                coef_dist=coef_matrix,
+                coef_dist=coef_matrix_internal,
                 feature_names=np.array(df_coef_cols)
             )
             if has_moderator:
-                save_kwargs['coef_dist_interaction'] = coef_matrix_interaction
+                save_kwargs['coef_dist_interaction'] = coef_matrix_interaction_internal
                 if n_mod_cols > 1:
                     save_kwargs['moderator_contrasts'] = np.array([f'contrast_{j+1}' for j in range(n_mod_cols)])
             np.savez_compressed(
@@ -3433,18 +3851,24 @@ def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, 
         interaction_report_df = None
         if has_moderator:
             if n_mod_cols <= 1:
-                df_coef_interaction = pd.DataFrame(
-                    coef_matrix_interaction, columns=df_coef_cols
+                df_coef_interaction_internal = pd.DataFrame(
+                    coef_matrix_interaction_internal, columns=df_coef_cols
+                )
+                df_coef_interaction_std = pd.DataFrame(
+                    coef_matrix_interaction_std, columns=df_coef_cols
                 )
             else:
                 l2_norms_int = np.sqrt(np.sum(
-                    coef_matrix_interaction ** 2, axis=1
+                    coef_matrix_interaction_internal ** 2, axis=1
                 ))
-                df_coef_interaction = pd.DataFrame(
+                df_coef_interaction_internal = pd.DataFrame(
                     l2_norms_int, columns=df_coef_cols
                 )
+                df_coef_interaction_std = pd.DataFrame(
+                    l2_norms_int / sd_y_per_iter[:, np.newaxis], columns=df_coef_cols
+                )
             int_stats = _compute_importance_preamble(
-                df_coef_interaction, all_feats_report,
+                df_coef_interaction_internal, df_coef_interaction_std, all_feats_report,
                 feat_std_map_report, config
             )
             interaction_report_df = _build_individual_report_df(
@@ -3452,17 +3876,20 @@ def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, 
             )
 
         _compute_importance_report(
-            df_coef, all_feats_report, feat_std_map_report, config, active_covs,
-            reducer_full_repr, X_brain, X_full_repr, Y, weights, subject_ids, best_model_repr,
+            df_coef_internal, df_coef_std, all_feats_report, feat_std_map_report, config, active_covs,
+            reducer_full_repr, X_brain, X_full_repr, Y, weights, subject_ids, oof_linear_pred,
             moderator=moderator,
-            interaction_report_df=interaction_report_df
+            interaction_report_df=interaction_report_df,
+            oof_mod_main=oof_mod_main
         )
 
         _write_tier2_single(
-            coef_matrix,
+            coef_matrix_internal,
+            coef_matrix_std,
             all_feats_report,
             config['paths']['output_dir'],
             config['stats_params']['ci_level'],
+            feat_std_map_report,
             effect_type='main' if moderator is not None else None,
             contrast='main' if moderator is not None else None,
         )
@@ -3470,19 +3897,25 @@ def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, 
         if has_moderator:
             if n_mod_cols <= 1:
                 _write_tier2_single(
-                    coef_matrix_interaction, all_feats_report, config['paths']['output_dir'], config['stats_params']['ci_level'],
+                    coef_matrix_interaction_internal, coef_matrix_interaction_std,
+                    all_feats_report, config['paths']['output_dir'], config['stats_params']['ci_level'],
+                    feat_std_map_report,
                     effect_type='interaction', contrast='moderator',
                 )
             else:
-                l2_norms = np.sqrt(np.sum(coef_matrix_interaction ** 2, axis=1))  # (B, P)
+                l2_norms = np.sqrt(np.sum(coef_matrix_interaction_internal ** 2, axis=1))  # (B, P)
+                l2_norms_std = l2_norms / sd_y_per_iter[:, np.newaxis]
                 _write_tier2_single(
-                    l2_norms, all_feats_report, config['paths']['output_dir'], config['stats_params']['ci_level'],
+                    l2_norms, l2_norms_std, all_feats_report, config['paths']['output_dir'], config['stats_params']['ci_level'],
+                    feat_std_map_report,
                     effect_type='interaction', contrast='L2_norm',
                 )
                 for j in range(n_mod_cols):
-                    per_contrast = coef_matrix_interaction[:, j, :]  # (B, P)
+                    per_contrast = coef_matrix_interaction_internal[:, j, :]  # (B, P)
+                    per_contrast_std = coef_matrix_interaction_std[:, j, :]
                     _write_tier2_single(
-                        per_contrast, all_feats_report, config['paths']['output_dir'], config['stats_params']['ci_level'],
+                        per_contrast, per_contrast_std, all_feats_report, config['paths']['output_dir'], config['stats_params']['ci_level'],
+                        feat_std_map_report,
                         effect_type='interaction', contrast=f'contrast_{j+1}',
                     )
     else:
@@ -3496,9 +3929,37 @@ def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, 
             coef_array_interaction = np.stack([r[1] for r in valid_res], axis=0)
             n_mod_cols = fold_models[0]['n_moderator_cols']
 
+        # Multi-class reference-differencing: transform (B, K, P) -> (B, K-1, P)
+        is_multiclass = (
+            config['analysis_type'] == 'classification'
+            and config.get('_runtime', {}).get('class_labels') is not None
+            and coef_array.shape[-2] > 2
+        )
+        if is_multiclass:
+            _mc_class_labels = config['_runtime']['class_labels']
+            _mc_ref_class = config['_runtime']['reference_class']
+            coef_array, task_labels = _reference_difference(coef_array, _mc_class_labels, _mc_ref_class)
+            if coef_array_interaction is not None:
+                if coef_array_interaction.ndim == 3:
+                    # Shape (B, K, P): K at axis -2
+                    coef_array_interaction, _ = _reference_difference(
+                        coef_array_interaction, _mc_class_labels, _mc_ref_class
+                    )
+                else:
+                    # Shape (B, K, n_mod_cols, P): K at axis -3; transpose to apply
+                    _cai_t = coef_array_interaction.transpose(0, 2, 1, 3)  # (B, n_mod_cols, K, P)
+                    _cai_diff, _ = _reference_difference(_cai_t, _mc_class_labels, _mc_ref_class)
+                    coef_array_interaction = _cai_diff.transpose(0, 2, 1, 3)  # (B, K-1, n_mod_cols, P)
+
+        coef_array_internal = coef_array
+        if sd_y_per_iter.ndim == 1:
+            coef_array_std = coef_array_internal / sd_y_per_iter[:, np.newaxis, np.newaxis]
+        else:
+            coef_array_std = coef_array_internal / sd_y_per_iter[:, :, np.newaxis]
+
         if config['stats_params'].get('save_distributions', True):
             save_kwargs = dict(
-                coef_dist=coef_array,
+                coef_dist=coef_array_internal,
                 feature_names=np.array(df_coef_cols),
                 task_labels=np.array(task_labels)
             )
@@ -3515,21 +3976,28 @@ def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, 
             out_dir_k = os.path.join(config['paths']['output_dir'], f'task_{lbl}')
             os.makedirs(out_dir_k, exist_ok=True)
             config_k = {**config, 'paths': {**config['paths'], 'output_dir': out_dir_k}}
-            df_coef_k = pd.DataFrame(coef_array[:, k, :], columns=df_coef_cols)
+            df_coef_k_internal = pd.DataFrame(coef_array_internal[:, k, :], columns=df_coef_cols)
+            df_coef_k_std = pd.DataFrame(coef_array_std[:, k, :], columns=df_coef_cols)
             Y_k = Y.iloc[:, k] if hasattr(Y, 'iloc') and Y.ndim > 1 else Y
 
             interaction_report_df_k = None
             if has_moderator:
                 if n_mod_cols <= 1:
-                    df_coef_int_k = pd.DataFrame(
+                    df_coef_int_k_internal = pd.DataFrame(
                         coef_array_interaction[:, k, :], columns=df_coef_cols
+                    )
+                    df_coef_int_k_std = pd.DataFrame(
+                        coef_array_interaction[:, k, :] / sd_y_per_iter[:, np.newaxis], columns=df_coef_cols
                     )
                 else:
                     int_k = coef_array_interaction[:, k, :, :]
                     l2_k = np.sqrt(np.sum(int_k ** 2, axis=1))
-                    df_coef_int_k = pd.DataFrame(l2_k, columns=df_coef_cols)
+                    df_coef_int_k_internal = pd.DataFrame(l2_k, columns=df_coef_cols)
+                    df_coef_int_k_std = pd.DataFrame(
+                        l2_k / sd_y_per_iter[:, np.newaxis], columns=df_coef_cols
+                    )
                 int_stats_k = _compute_importance_preamble(
-                    df_coef_int_k, all_feats_report,
+                    df_coef_int_k_internal, df_coef_int_k_std, all_feats_report,
                     feat_std_map_report, config_k
                 )
                 interaction_report_df_k = _build_individual_report_df(
@@ -3537,16 +4005,19 @@ def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, 
                 )
 
             _compute_importance_report(
-                df_coef_k, all_feats_report, feat_std_map_report, config_k, active_covs,
-                reducer_full_repr, X_brain, X_full_repr, Y_k, weights, subject_ids, best_model_repr,
+                df_coef_k_internal, df_coef_k_std, all_feats_report, feat_std_map_report, config_k, active_covs,
+                reducer_full_repr, X_brain, X_full_repr, Y_k, weights, subject_ids, oof_linear_pred,
                 moderator=moderator,
-                interaction_report_df=interaction_report_df_k
+                interaction_report_df=interaction_report_df_k,
+                oof_mod_main=oof_mod_main
             )
             _write_tier2_single(
-                coef_array[:, k, :],
+                coef_array_internal[:, k, :],
+                coef_array_std[:, k, :],
                 all_feats_report,
                 out_dir_k,
                 config['stats_params']['ci_level'],
+                feat_std_map_report,
                 effect_type='main' if moderator is not None else None,
                 contrast='main' if moderator is not None else None,
             )
@@ -3557,22 +4028,28 @@ def run_bootstrap(config, X_brain, Y, weights, subject_ids, X_cov, active_covs, 
                 if n_mod_cols <= 1:
                     _write_tier2_single(
                         coef_array_interaction[:, k, :],
+                        coef_array_interaction[:, k, :] / sd_y_per_iter[:, np.newaxis],
                         all_feats_report,
                         out_dir_k,
                         config['stats_params']['ci_level'],
+                        feat_std_map_report,
                         effect_type='interaction', contrast='moderator',
                     )
                 else:
                     interaction_k = coef_array_interaction[:, k, :, :]  # (B, n_mod_cols, P)
                     l2_norms_k = np.sqrt(np.sum(interaction_k ** 2, axis=1))  # (B, P)
+                    l2_norms_k_std = l2_norms_k / sd_y_per_iter[:, np.newaxis]
                     _write_tier2_single(
-                        l2_norms_k, all_feats_report, out_dir_k, config['stats_params']['ci_level'],
+                        l2_norms_k, l2_norms_k_std, all_feats_report, out_dir_k, config['stats_params']['ci_level'],
+                        feat_std_map_report,
                         effect_type='interaction', contrast='L2_norm',
                     )
                     for j in range(n_mod_cols):
                         per_contrast_k = interaction_k[:, j, :]  # (B, P)
+                        per_contrast_k_std = per_contrast_k / sd_y_per_iter[:, np.newaxis]
                         _write_tier2_single(
-                            per_contrast_k, all_feats_report, out_dir_k, config['stats_params']['ci_level'],
+                            per_contrast_k, per_contrast_k_std, all_feats_report, out_dir_k, config['stats_params']['ci_level'],
+                            feat_std_map_report,
                             effect_type='interaction', contrast=f'contrast_{j+1}',
                         )
 
@@ -3813,6 +4290,23 @@ def main():
     try:
         X_brain, X_cov, Y, weights, subj_ids, active_covs, apriori_map, moderator = load_and_prep_data(config, out_dir)
 
+        # Validate reference_class for multi-class classification
+        is_multiclass = config['analysis_type'] == 'classification' and len(np.unique(Y)) > 2
+        if is_multiclass:
+            ref_class = config.get('data_cols', {}).get('reference_class')
+            if ref_class is None:
+                sys.exit(
+                    "CRITICAL: config.data_cols.reference_class is required for multi-class classification. "
+                    "Specify one of the class labels as the reference."
+                )
+            classes = sorted(np.unique(Y).tolist())
+            if ref_class not in classes:
+                sys.exit(
+                    f"CRITICAL: reference_class '{ref_class}' not found in outcome classes {classes}."
+                )
+            config.setdefault('_runtime', {})['reference_class'] = ref_class
+            config['_runtime']['class_labels'] = classes
+
         if args.mode == 'perm_worker':
             run_permutation_test(
                 config, X_brain, Y, weights, X_cov, active_covs,
@@ -3847,16 +4341,21 @@ def main():
             }).to_csv(os.path.join(out_dir, 'permutation_result.csv'), index=False)
 
         else:  # main mode
-            actual, fold_models = run_nested_cv(config, X_brain, Y, weights, X_cov, active_covs, apriori_map, moderator)
+            actual, fold_models, cv_data = run_nested_cv(config, X_brain, Y, weights, X_cov, active_covs, apriori_map, moderator)
             # Store metric for perm worker label
             _, _, _, metric = create_model_and_param_dist(config, ['dummy'], [], Y=Y)
             config.setdefault('_runtime', {})['metric'] = metric
 
+            _write_fold_performance(cv_data, config, out_dir)
+
+            sd_y_divisors = _compute_sd_y_divisor(config, Y, cv_data)
+            logging.info(f"Per-fold SD(Y/Y*) divisors computed for {len(sd_y_divisors)} folds.")
+
             # Tier 1 inference: fold-wise ensemble t-test (new Step 5)
-            run_tier1_inference(config, fold_models, X_brain, Y, active_covs, moderator)
+            run_tier1_inference(config, fold_models, X_brain, Y, active_covs, moderator, sd_y_divisors=sd_y_divisors)
 
             run_selection_frequency(config, X_brain, Y, weights, X_cov, active_covs, fold_models, apriori_map, moderator)
-            run_bootstrap(config, X_brain, Y, weights, subj_ids, X_cov, active_covs, fold_models, apriori_map, moderator)
+            run_bootstrap(config, X_brain, Y, weights, subj_ids, X_cov, active_covs, fold_models, apriori_map, moderator, sd_y_divisors=sd_y_divisors, cv_data=cv_data)
             if not args.skip_main_perm:
                 run_permutation_test(
                     config, X_brain, Y, weights, X_cov, active_covs,

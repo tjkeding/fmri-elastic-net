@@ -15,7 +15,7 @@ AI assistance was utilized for **analysis pipeline development**, encompassing:
 - Code architecture and design decisions for an elastic net predictive modeling pipeline supporting regression (single-task and multi-task) and classification (binary and multi-class)
 - Statistical methodology review and validation, including nested cross-validation, bootstrap confidence interval construction, Partial Ridge refitting, Firth-penalized logistic regression, and interaction modeling
 - Implementation of pipeline modules (dimensionality reduction, covariate handling, sample weighting, moderator interaction modeling, two-tier inference)
-- Test suite development and validation (811+ unit and integration tests)
+- Test suite development and validation (855+ unit and integration tests)
 - Documentation authoring and refinement (README, INPUT_SPECIFICATION, code docstrings)
 
 AI was **not** used for:
@@ -63,7 +63,7 @@ Key properties of this workflow:
 
 The researcher maintained full oversight and decision authority throughout the development process:
 
-- **(a)** Defined all statistical methodology and analytical approach, including: the two-tier inference design (liberal Tier 1 screen, conservative Tier 2 confirmation), the fold-wise ensemble architecture, the Partial Ridge CI debiasing strategy, the interaction modeling architecture (post-reduction construction, heredity-preserving main effect protection), and the Firth logistic fallback threshold.
+- **(a)** Defined all statistical methodology and analytical approach, including: the two-tier inference design (liberal Tier 1 screen, conservative Tier 2 confirmation), the fold-wise ensemble architecture, the Partial Ridge CI debiasing strategy, the interaction modeling architecture (post-reduction construction, heredity-preserving main effect protection), and the Firth logistic fallback threshold; the fully standardized coefficient definition (std_coef as beta: SDs of Y per 1 SD of X, replacing the prior X-standardized-only definition); and the interaction-visualization residualization scheme (full conditional relationship via out-of-fold ensemble predictions).
 
 - **(b)** Triaged every critical review finding with explicit accept/reject/modify decisions, documented in brainstorm reports with rationale for each determination. Multiple CR rounds were conducted per implementation phase.
 
@@ -96,6 +96,8 @@ Raw session transcripts are excluded for privacy reasons. The structured reports
 - **2026-08-06**: Moderator integration bug fixes (4 findings): `_reconstruct_x_full` and `predict_ensemble` missing moderator and interaction columns, `calculate_visualization_data` partial-dependence decomposition redesigned to separate main and interaction effects into distinct CSVs, subsample size diagnostic updated to use full model dimensionality (P_model) when interactions are present. Test suite expansion (753 to 808 tests) with comprehensive moderator option matrix coverage. Reports synced: 1 brainstorm, 1 implement (plan + build), 2 test, 1 document.
 
 - **2026-07-29**: Interaction modeling (brain x moderator) implementation, CR-driven fixes (logistic Partial Ridge back-transformation, multi-output selected_mask, Hotelling degeneracy guards, levels_override, documentation updates), comprehensive test suite expansion (742 to 753 tests), and AID infrastructure creation. Reports synced: 2 brainstorm, 1 CR, 2 implement (plan + build) for multi-output interaction reporting, 1 implement (plan + build) for CR-driven fixes, 1 test, 1 document.
+
+- **2026-09-09**: Fully standardized coefficient redefinition (std_coef as beta: SDs of Y per 1 SD of X, replacing the prior X-standardized-only definition) with dual raw/std reporting across Tier 1, Tier 2, and importance outputs. Interaction-visualization residualization redesigned to reflect the full conditional relationship (brain main + moderator main + interaction) via out-of-fold (OOF) ensemble predictions, replacing the prior single-fold representative model. Two P0 bug fixes: K>2 nominal moderator broadcast crash (3D vs 2D array ndim branching for SD(Y) divisor alignment) and run_bootstrap cv_data required-parameter change (keyword-only, no default). run_nested_cv now returns a 3-tuple (score, fold_models, cv_data). Test suite expansion (811 to 855 tests) with coverage for all four changes. Reports synced: 1 brainstorm, 4 implement (2 plan + 2 build), 2 test, 1 document.
 
 ## 8. References
 

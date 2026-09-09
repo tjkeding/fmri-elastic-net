@@ -101,6 +101,8 @@ shape of the outcome column(s):
 | Binary classification | `"classification"` | One integer column, 2 unique labels | `LogisticRegression(penalty='elasticnet', solver='saga')` |
 | Multi-class classification | `"classification"` | One integer column, 3+ unique labels | `LogisticRegression(penalty='elasticnet', solver='saga')` with OVR decomposition |
 
+For multi-class classification, `data_cols.reference_class` must be specified. This parameter designates the reference class label; all coefficients and confidence intervals are reported as class-vs-reference contrasts (K-1 contrasts for K classes). The pipeline halts with an informative error if `reference_class` is absent for a multi-class outcome. For binary classification and regression, `reference_class` is ignored.
+
 Multi-task regression (`MultiTaskElasticNet`) has two important constraints:
 - **Shared sparsity**: all tasks share the same feature sparsity. Features are jointly
   selected (non-zero) or jointly excluded (zero) for all tasks simultaneously (assumes
@@ -243,7 +245,7 @@ respectively). Interaction visualization includes a `moderator_value` column rec
 each subject's moderator value for downstream plotting. Interaction visualization is
 skipped for K>2 nominal moderators (partial-dependence decomposition is not well-defined
 for multi-contrast interactions) and for `apriori` reduction (cluster-level interaction
-visualization is not produced).
+visualization is not produced). Interaction-effect partial associations reflect the full conditional relationship (brain main effect + moderator main effect + interaction effect), computed via out-of-fold (OOF) ensemble linear predictions: each subject's contribution uses the pipeline (reducer, scaler, model coefficients) from the fold in which that subject was held out, rather than a single representative fold's model.
 
 ### Known limitation
 
@@ -321,6 +323,8 @@ All output files are written to `paths.output_dir`:
 |------|-------------|
 | `nested_cv_scores.csv` | Observed model performance (R² or AUC) |
 | `model_performance.csv` | Comprehensive evaluation metrics (regression: RMSE, MAE, R², Pearson r; classification: AUC-ROC, Log-Loss, Sensitivity, Specificity, Balanced Accuracy) |
+| `model_performance_per_fold.csv` | Per-fold performance metric (R2 for regression, AUC_ROC for classification) with fold index and held-out sample size |
+| `model_performance_fold_summary.csv` | Summary statistics (mean, SD, min, max) of per-fold performance across all K folds |
 | `confusion_matrix.csv` | Confusion matrix (multi-class classification only) |
 | `permutation_null_distribution_{metric}.csv` | Null distribution from label permutation |
 | `permutation_result.csv` | Observed score, p-value, n_permutations (aggregate mode) |
@@ -368,9 +372,10 @@ parameter types, ranges, constraints, output schemas, and known edge cases.
   fold-specific hyperparameter configurations. Percentile CIs from this mixture may have
   sub-nominal coverage for threshold-adjacent features; they are best interpreted as
   sensitivity diagnostics (Efron & Tibshirani, 1993, Ch. 13).
+- `std_coef_mean` reports the fully standardized coefficient (dimensionless: SDs of Y per 1 SD of X). For regression, the divisor is per-fold SD(Y). For classification, the divisor is per-fold SD(Y*) using the latent variable approach (Long, 1997; Menard, 2004, 2011): SD(Y*) = sqrt(Var(cross-validated logits) + pi^2/3). Both `raw_coef_mean` (change in Y per unit change in X) and `std_coef_mean` (fully standardized) are reported in all output files.
 - `raw_coef_mean` for reduction methods (cluster_pca, apriori, ica) is approximate:
-  the back-projected standardized coefficient is divided by original-feature SD, which
-  is not equivalent to a standardized beta from direct regression on original features.
+  the back-projected coefficient divided by original-feature SD is not equivalent to a
+  standardized beta from direct regression on original features.
   `std_coef_mean` and `pd` are the primary inferential quantities.
 - Selection frequency magnitudes may be elevated because hyperparameters are fixed from
   full-N tuning while each subsample uses N/2. Relative ordering is

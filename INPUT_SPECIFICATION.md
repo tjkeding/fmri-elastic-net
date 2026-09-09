@@ -154,6 +154,7 @@ and block permutation fold loops to avoid nested parallelism with the outer
 | `data_cols.sample_weight_col` | str or null | No | Optional sample weight column name |
 | `data_cols.moderator_col` | str or null | No | Optional column name for a moderating variable (brain x moderator interactions). When non-null, `moderator_type` is required |
 | `data_cols.moderator_type` | str or null | Only when `moderator_col` is non-null | `"continuous"` or `"nominal"`. Determines coding scheme: continuous = mean-centered on fold-local training-split mean; nominal = deviation (effect) coded relative to the last sorted level |
+| `data_cols.reference_class` | str or null | Required for multi-class classification | Specifies the reference class label for coefficient contrasts. All coefficients and confidence intervals are reported as class-vs-reference contrasts (K-1 contrasts for K classes). Pipeline halts if absent for multi-class. Ignored for binary classification and regression |
 
 ### `clustering_params` Section (used only when `feature_reduction_method: "cluster_pca"`)
 
@@ -514,13 +515,15 @@ as part of `main` mode; not skippable.
 - Convergence failures tracked and logged as a count
 
 **Aggregation:**
-- `std_coef_mean`: mean standardized coefficient across bootstrap samples
+- `std_coef_mean`: mean fully standardized coefficient across bootstrap samples. For regression, the divisor is per-fold SD(Y). For classification, the divisor is per-fold SD(Y*) following the latent variable approach (Long, 1997; Menard, 2004, 2011): SD(Y*) = sqrt(Var(cross-validated logits) + pi^2/3). Reports SDs of Y (or Y*) per 1 SD of X.
 - `std_ci_low/high`: quantiles at `(alpha/2, 1-alpha/2)`
-- `raw_coef_mean = std_coef_mean / feature_std` (approximate — see limitations)
+- `raw_coef_mean`: mean raw (Y-unit-scale) coefficient: change in Y per unit change in X. Derived as `std_coef_mean * SD(Y/Y*) / feature_std` (approximate with reduction methods).
 - `pd`: `max(Pr(coef > 0), Pr(coef < 0))` across bootstrap samples
 - `is_significant`: CI does not cross zero
 - `p_value`: `clip(2 * (1 - pd), 0, 1)`
 - `is_significant_fdr`: BH-FDR at q = 0.05 applied independently per output CSV
+
+**Multi-class output structure:** For K-class classification with a specified `reference_class`, bootstrap CIs and selection frequency are reported as K-1 class-vs-reference contrasts. The `std_coef_mean` column for K>2 nominal moderators reports the L2 norm across K-1 contrasts (collapsing the multivariate structure into a scalar).
 
 **Output files by `feature_reduction_method`:**
 - `none`: `report_feature_importance.csv`
@@ -573,6 +576,12 @@ Metrics: `Log_Loss`, `AUC_ROC`, `Balanced_Accuracy`, `Sensitivity`, `Specificity
 Per-class (`scope = "per_class"`): `AUC_ROC`, `Sensitivity`, `Specificity`.
 Macro (`scope = "macro"`, `class = "all"`): `Log_Loss`, `AUC_ROC`, `Balanced_Accuracy`.
 
+### `model_performance_per_fold.csv`
+Per-fold performance metrics from the outer CV loop. Columns: `fold` (integer fold index, 0-based), `n_held_out` (number of held-out samples in that fold), `metric` (R2 for regression, AUC_ROC for classification), `value` (metric value on held-out data for that fold).
+
+### `model_performance_fold_summary.csv`
+Summary statistics of per-fold performance across all K outer folds. Columns: `metric`, `mean`, `sd`, `min`, `max`. Derived from `model_performance_per_fold.csv`.
+
 ### `confusion_matrix.csv`
 Produced only for multi-class classification. Shape K × K. Header row contains integer
 column indices 0 through K−1. No row index.
@@ -598,10 +607,10 @@ permutation test or `aggregate` mode.
 | Column | Type | Description |
 |--------|------|-------------|
 | `feature` / `cluster_id` | str | Feature or cluster identifier |
-| `std_coef_mean` | float | Mean standardized coefficient across bootstrap samples |
-| `std_ci_low` | float | Lower bootstrap CI bound (standardized) |
-| `std_ci_high` | float | Upper bootstrap CI bound (standardized) |
-| `raw_coef_mean` | float | Mean coefficient in approximate original units (`std_coef_mean / feature_std`) |
+| `std_coef_mean` | float | Mean fully standardized coefficient (SDs of Y or Y* per 1 SD of X) across bootstrap samples |
+| `std_ci_low` | float | Lower bootstrap CI bound (fully standardized) |
+| `std_ci_high` | float | Upper bootstrap CI bound (fully standardized) |
+| `raw_coef_mean` | float | Mean raw (Y-unit-scale) coefficient: change in Y per unit change in X (approximate with reduction methods) |
 | `raw_ci_low` | float | Lower CI in approximate original units |
 | `raw_ci_high` | float | Upper CI in approximate original units |
 | `pd` | float | Probability of direction: `max(Pr(coef>0), Pr(coef<0))` across bootstrap samples |
@@ -662,9 +671,7 @@ and outcome. Only written if at least one significant feature exists. Produced b
 Subject-level partial association data for significant interaction terms. Same schema as
 the main-effect plotting CSV, with the addition of a `moderator_value` column recording
 each subject's raw moderator value for downstream visualization (e.g., scatterplot
-colored by moderator group). Interaction partialling computes: `f_weight * f_scaled *
-M_coded` where `f_weight` is the interaction coefficient, `f_scaled` is the standardized
-brain feature value, and `M_coded` is the coded moderator value. Not produced for K>2
+colored by moderator group). Interaction partialling computes the full conditional relationship: `lin_contrib = brain_main + mod_main + int_contrib`, where `brain_main = brain_raw_coef * f_centered` (main brain-effect contribution, using `raw_coef_mean` from the corresponding main-effect report), `mod_main` is the moderator main-effect out-of-fold (OOF) ensemble linear contribution, and `int_contrib = f_raw_coef * f_centered * M_coded` (`f_raw_coef` the interaction coefficient, `f_centered` the mean-centered raw brain feature value, `M_coded` the coded moderator value). `mod_main` is derived from `_compute_oof_visualization_data`: each subject's linear contribution uses the pipeline (reducer, scaler, model coefficients) from the fold in which that subject was held out, rather than a single representative fold's model. Not produced for K>2
 nominal moderators (partial-dependence decomposition is not well-defined for
 multi-contrast interactions) or for `apriori` reduction (cluster-level interaction
 visualization is excluded by design). Produced by `calculate_visualization_data` with
